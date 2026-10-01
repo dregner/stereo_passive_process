@@ -1,0 +1,69 @@
+passive_stereo_node:
+  ros__parameters:
+    # ---- Camera serials (match your BFS cameras) --------------------------
+    cam_left_serial:  "22548033"
+    cam_right_serial: "22548025"
+
+    # ---- Acquisition settings -------------------------------------------
+    frame_rate:         30.0
+    exposure_time:      33333.84   # microseconds (1/30 s)
+    gain:               0.0        # dB (used only when gain_auto=false)
+    gain_auto:          false
+    balance_white_auto: true
+    binning:            1          # 1 = full native resolution
+
+    # ---- Trigger mode ----------------------------------------------------
+    # true  -> hardware trigger via Jetson GPIO PWM (camera Line3)
+    # false -> free-running continuous acquisition
+    trigger_mode:     true
+    trigger_delay_us: 29
+
+    # ---- Jetson GPIO for PWM trigger generation -------------------------
+    # Jetson Orin: GPIO chip=gpiochip0
+    # Pin 16 (GPIO23) is commonly available on the 40-pin header
+    # Run 'gpioinfo' to find the correct line offset for your board.
+    gpio_chip: "gpiochip0"
+    gpio_line: 106       # Adjust for your Jetson model/pin
+
+    # ---- Stereo calibration ---------------------------------------------
+    # OpenCV FileStorage YAML with K1, D1, K2, D2, R, T matrices.
+    # See config/stereo_calibration_template.yaml for the format.
+    calibration_file: "/home/daniel/ros2_ws/src/passive_stereo_capture/config/stereo_calibration_bfs.yaml"
+
+    # ---- CLAHE (applied in Lab L-channel) --------------------------------
+    clahe_clip_limit: 2.0
+    clahe_tile_size:  8
+
+    # ---- SLAM (ORB-SLAM3) ------------------------------------------------
+    slam_enabled: true
+    slam_voc_file: "/home/daniel/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/vocabulary/ORBvoc.txt"
+    slam_settings_file: "/home/daniel/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/config/stereo_bluerov.yaml"
+    slam_use_pangolin: false   # set true to open Pangolin viewer (needs X11)
+    slam_max_width:  800       # SLAM input image max width (maintains aspect ratio)
+    slam_max_height: 600       # SLAM input image max height
+    slam_enu_publish: true
+    slam_tf_publish:  false
+
+    # ---- Coordinate frames -----------------------------------------------
+    namespace:        "Passive"
+    frame_id:         "map"
+    parent_frame_id:  "base_link"
+    child_frame_id:   "Passive/left_camera_link"
+
+    # ---- Dense disparity / pointcloud (Retinify GPU) ---------------------
+    disparity_enabled:  true
+    depth_mode:         "accurate"   # "fast" | "balanced" | "accurate"
+    max_dist:           15.0         # metres; 0 = no limit
+    sampling_factor:    1.0          # 1.0 = all pixels; 0.5 = every other pixel
+    crop_factor:        1.0          # 1.0 = full frame; 0.8 = central 80%
+    publish_confidence: true
+    min_confidence:     0.35
+    confidence_radius:  2
+    confidence_alpha:   2.0
+    disp_frame_id:      "Passive/left_camera_link"
+
+    # ---- Preview (compressed JPEG streaming) ----------------------------
+    preview_enabled:  true
+    preview_width:    612
+    preview_height:   512
+    preview_quality:  50
