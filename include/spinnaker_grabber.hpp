@@ -31,19 +31,22 @@ struct CameraConfig {
     int         binning{1};                 ///< 1 = full resolution
     int         acquire_timeout_ms{2000};
     int         frame_id_sync_tolerance{0}; ///< max FrameID difference for soft sync (0 = exact)
+    int         max_consecutive_errors{10}; ///< consecutive grab errors before shutdown
 };
 
-/// Acquired raw frame (before debayer)
+/// A raw frame straight from the sensor — BayerRG8, no conversion.
+/// Downstream workers choose their own conversion (Gray for SLAM, RGB for Retinify/Preview).
 struct RawFrame {
-    cv::Mat    image;        ///< Bayer RG8 mono mat (wraps Spinnaker data after convert)
-    uint64_t   frame_id;
-    double     timestamp_sec;
+    cv::Mat    image;           ///< CV_8UC1, BayerRG8 pattern (unconverted sensor data)
+    uint64_t   frame_id{0};
+    uint64_t   timestamp_ns{0}; ///< Spinnaker chunk timestamp in nanoseconds
 };
 
-/// Callback type: called on each synchronized stereo pair (Bayer RG8)
+/// Callback type: called on each synchronized stereo pair
 using StereoCallback = std::function<void(const RawFrame & left, const RawFrame & right)>;
 
 /// Acquires synchronized stereo frames from two BFS Spinnaker cameras.
+/// Delivers raw BayerRG8 frames — all pixel format conversion is deferred to consumers.
 /// In hardware trigger mode, both cameras fire on the same GPIO pulse;
 /// frames are matched by FrameID from chunk data.
 /// In continuous mode, frames are matched by closest FrameID.
@@ -69,7 +72,7 @@ private:
     void grabThread(Spinnaker::CameraPtr cam, bool is_left);
     void syncThread();
 
-    CameraConfig cfg_;
+    CameraConfig   cfg_;
     StereoCallback callback_;
 
     Spinnaker::SystemPtr    system_;

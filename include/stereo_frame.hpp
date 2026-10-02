@@ -1,21 +1,36 @@
 #pragma once
 
 #include <memory>
+#include <cstdint>
 #include <opencv2/core.hpp>
 #include <rclcpp/time.hpp>
 
 namespace passive_stereo_capture
 {
 
-/// Holds a synchronized, rectified, CLAHE-enhanced stereo pair.
+/// Holds a synchronized, debayered stereo pair for fan-out to all workers.
 /// Shared across all worker threads via shared_ptr — zero-copy hand-off.
+///
+/// Pipeline:
+///   left_gray  — Bayer→GRAY (direct) → rectify  — for SLAM (resize+CLAHE inside SlamWorker)
+///   left_rgb   — Bayer→RGB → rectify → CLAHE     — for Retinify and Preview (shared)
 struct StereoFrame
 {
-    cv::Mat  left;              ///< RGB8, rectified + CLAHE
-    cv::Mat  right;             ///< RGB8, rectified + CLAHE
-    double   timestamp_sec{0.0};
+    // SLAM path: rectified grayscale (full-res).
+    // BayerRG2GRAY is a single-step direct conversion, much cheaper than full debayer.
+    // SlamWorker resizes and applies grayscale CLAHE internally.
+    cv::Mat  left_gray;    ///< CV_8UC1, rectified (no CLAHE)
+    cv::Mat  right_gray;   ///< CV_8UC1, rectified (no CLAHE)
+
+    // Disparity + Preview path: rectified RGB8 with CLAHE applied in CIE Lab L-channel.
+    // Both Retinify (disparity) and Preview reuse these same images — one debayer for two consumers.
+    cv::Mat  left_rgb;     ///< CV_8UC3 RGB8, rectified + CLAHE
+    cv::Mat  right_rgb;    ///< CV_8UC3 RGB8, rectified + CLAHE
+
+    uint64_t     timestamp_ns{0};    ///< Spinnaker chunk timestamp in nanoseconds
+    double       timestamp_sec{0.0}; ///< Same, as seconds (for TrackStereo)
     rclcpp::Time stamp;
-    uint64_t frame_id{0};      ///< From Spinnaker chunk data (FrameID)
+    uint64_t     frame_id{0};        ///< From Spinnaker chunk data (FrameID)
 };
 
 using StereoFramePtr = std::shared_ptr<StereoFrame>;

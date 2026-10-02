@@ -3,6 +3,8 @@
 #include <chrono>
 #include <stdexcept>
 
+#include <opencv2/imgproc.hpp>
+
 namespace passive_stereo_capture
 {
 
@@ -15,9 +17,16 @@ PassiveStereoNode::PassiveStereoNode(const rclcpp::NodeOptions & options)
 
 PassiveStereoNode::~PassiveStereoNode()
 {
-    // Stop in reverse-init order
+    // 1. Stop grabber — no more raw pairs pushed to preprocess queue
+    if (grabber_) grabber_->stop();
+
+    // 2. Drain and stop preprocess thread — no more StereoFrames pushed to workers
+    preprocess_running_.store(false);
+    preprocess_queue_.shutdown();
+    if (preprocess_thread_.joinable()) preprocess_thread_.join();
+
+    // 3. Stop workers last
     if (gpio_trigger_) gpio_trigger_->stop();
-    if (grabber_)      grabber_->stop();
     if (slam_worker_)  slam_worker_->stop();
     if (disp_worker_)  disp_worker_->stop();
     if (prev_worker_)  prev_worker_->stop();
@@ -36,15 +45,16 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("binning",            1);
     declare_parameter("trigger_mode",       false);
     declare_parameter("trigger_delay_us",   29);
+    declare_parameter("max_consec_errors",  10);
 
-    // GPIO (for hardware trigger generation)
+    // GPIO
     declare_parameter("gpio_chip",         std::string("gpiochip0"));
-    declare_parameter("gpio_line",         (int)106);   // example Jetson Orin pin 16
+    declare_parameter("gpio_line",         (int)85);   // PN.01 = GPIO27 = trigger line
 
     // Calibration
     declare_parameter("calibration_file",  std::string(""));
 
-    // CLAHE
+    // CLAHE (applied on RGB for Retinify/Preview; gray CLAHE params reused for SLAM)
     declare_parameter("clahe_clip_limit",  2.0);
     declare_parameter("clahe_tile_size",   8);
 
@@ -53,10 +63,10 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("slam_voc_file",       std::string(""));
     declare_parameter("slam_settings_file",  std::string(""));
     declare_parameter("slam_use_pangolin",   false);
-    declare_parameter("slam_max_width",      800);
-    declare_parameter("slam_max_height",     600);
+    declare_parameter("slam_scale_factor",   1.0);   ///< e.g. 0.33 → ~800×680 from 2448×2048
     declare_parameter("slam_enu_publish",    true);
     declare_parameter("slam_tf_publish",     false);
+    declare_parameter("slam_cloud_hz",       2.0);
     declare_parameter("frame_id",            std::string("map"));
     declare_parameter("parent_frame_id",     std::string("base_link"));
     declare_parameter("child_frame_id",      std::string("Passive/left_camera_link"));
@@ -79,7 +89,6 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("preview_height",   512);
     declare_parameter("preview_quality",  50);
 
-    // Namespace prefix (for topics)
     declare_parameter("namespace",        std::string("Passive"));
 }
 
@@ -90,12 +99,11 @@ void PassiveStereoNode::init()
         return "/" + ns + "/" + topic;
     };
 
-    // ── QoS ────────────────────────────────────────────────────────────────────
     auto sensor_qos = rclcpp::SensorDataQoS();
     rclcpp::QoS best_effort_qos(2);
     best_effort_qos.reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
 
-    // ── CLAHE ──────────────────────────────────────────────────────────────────
+    // ── CLAHE (full-res RGB for Retinify/Preview path) ─────────────────────────
     double clip  = get_parameter("clahe_clip_limit").as_double();
     int    tiles = get_parameter("clahe_tile_size").as_int();
     clahe_ = cv::createCLAHE(clip, cv::Size(tiles, tiles));
@@ -130,20 +138,21 @@ void PassiveStereoNode::init()
         slam_cfg.voc_file       = get_parameter("slam_voc_file").as_string();
         slam_cfg.settings_file  = get_parameter("slam_settings_file").as_string();
         slam_cfg.use_pangolin   = get_parameter("slam_use_pangolin").as_bool();
-        slam_cfg.max_width      = get_parameter("slam_max_width").as_int();
-        slam_cfg.max_height     = get_parameter("slam_max_height").as_int();
+        slam_cfg.scale_factor   = get_parameter("slam_scale_factor").as_double();
         slam_cfg.frame_id       = get_parameter("frame_id").as_string();
         slam_cfg.parent_frame_id= get_parameter("parent_frame_id").as_string();
         slam_cfg.child_frame_id = get_parameter("child_frame_id").as_string();
         slam_cfg.enu_publish    = get_parameter("slam_enu_publish").as_bool();
         slam_cfg.tf_publish     = get_parameter("slam_tf_publish").as_bool();
+        slam_cfg.cloud_pub_hz   = get_parameter("slam_cloud_hz").as_double();
+        slam_cfg.clahe_clip     = clip;
+        slam_cfg.clahe_tiles    = tiles;
 
         slam_worker_ = std::make_unique<SlamWorker>(
             this, pub_pose, pub_cloud, pub_path, slam_cfg);
         slam_worker_->start();
         RCLCPP_INFO(get_logger(), "SLAM worker started");
 
-        // Service to reset SLAM
         reset_srv_ = create_service<std_srvs::srv::Trigger>(
             mk("slam/reset"),
             std::bind(&PassiveStereoNode::onSlamReset, this,
@@ -200,19 +209,23 @@ void PassiveStereoNode::init()
             chip.c_str(), line, fps);
     }
 
+    // ── Preprocess Thread ──────────────────────────────────────────────────────
+    preprocess_running_.store(true);
+    preprocess_thread_ = std::thread(&PassiveStereoNode::preprocessThread, this);
+
     // ── Spinnaker Grabber ──────────────────────────────────────────────────────
     CameraConfig cam_cfg;
-    cam_cfg.serial_left       = get_parameter("cam_left_serial").as_string();
-    cam_cfg.serial_right      = get_parameter("cam_right_serial").as_string();
-    cam_cfg.frame_rate        = get_parameter("frame_rate").as_double();
-    cam_cfg.exposure_time_us  = get_parameter("exposure_time").as_double();
-    cam_cfg.gain_db           = get_parameter("gain").as_double();
-    cam_cfg.gain_auto         = get_parameter("gain_auto").as_bool();
-    cam_cfg.balance_white_auto= get_parameter("balance_white_auto").as_bool();
-    cam_cfg.trigger_mode      = trigger_enabled_;
-    cam_cfg.trigger_delay_us  = get_parameter("trigger_delay_us").as_int();
-    cam_cfg.binning           = get_parameter("binning").as_int();
-    // In HW trigger mode allow exact FrameID match; in continuous allow ±1
+    cam_cfg.serial_left            = get_parameter("cam_left_serial").as_string();
+    cam_cfg.serial_right           = get_parameter("cam_right_serial").as_string();
+    cam_cfg.frame_rate             = get_parameter("frame_rate").as_double();
+    cam_cfg.exposure_time_us       = get_parameter("exposure_time").as_double();
+    cam_cfg.gain_db                = get_parameter("gain").as_double();
+    cam_cfg.gain_auto              = get_parameter("gain_auto").as_bool();
+    cam_cfg.balance_white_auto     = get_parameter("balance_white_auto").as_bool();
+    cam_cfg.trigger_mode           = trigger_enabled_;
+    cam_cfg.trigger_delay_us       = get_parameter("trigger_delay_us").as_int();
+    cam_cfg.binning                = get_parameter("binning").as_int();
+    cam_cfg.max_consecutive_errors = get_parameter("max_consec_errors").as_int();
     cam_cfg.frame_id_sync_tolerance = trigger_enabled_ ? 0 : 1;
 
     grabber_ = std::make_unique<SpinnakerGrabber>(cam_cfg);
@@ -227,33 +240,66 @@ void PassiveStereoNode::init()
         trigger_enabled_ ? "HW" : "continuous");
 }
 
+// Non-blocking: just push raw Bayer pair to preprocess queue and return immediately.
+// This runs on the sync thread — must not block.
 void PassiveStereoNode::onStereoFrame(
     const RawFrame & left_raw, const RawFrame & right_raw)
 {
-    // ── 1. Rectify ────────────────────────────────────────────────────────────
-    cv::Mat left_rect, right_rect;
-    rectifier_->rectify(left_raw.image, right_raw.image, left_rect, right_rect);
+    preprocess_queue_.push({left_raw, right_raw});
+}
 
-    // ── 2. CLAHE (Lab L-channel) ──────────────────────────────────────────────
-    left_rect  = applyClaheRGB(left_rect,  clahe_);
-    right_rect = applyClaheRGB(right_rect, clahe_);
+void PassiveStereoNode::preprocessThread()
+{
+    while (preprocess_running_.load()) {
+        RawPair pair;
+        if (!preprocess_queue_.pop(pair)) continue;
 
-    // ── 3. Build StereoFrame ──────────────────────────────────────────────────
-    // Use left camera timestamp; in HW trigger mode both are (effectively) identical
-    auto frame = std::make_shared<StereoFrame>();
-    frame->left          = std::move(left_rect);
-    frame->right         = std::move(right_rect);
-    frame->timestamp_sec = left_raw.timestamp_sec;
-    frame->frame_id      = left_raw.frame_id;
-    // Build rclcpp::Time from seconds (Spinnaker clock)
-    uint64_t ns = static_cast<uint64_t>(left_raw.timestamp_sec * 1e9);
-    frame->stamp = rclcpp::Time(static_cast<int32_t>(ns / 1'000'000'000ULL),
-                                 static_cast<uint32_t>(ns % 1'000'000'000ULL));
+        const RawFrame & left_raw  = pair.first;
+        const RawFrame & right_raw = pair.second;
 
-    // ── 4. Dispatch to workers (non-blocking push) ────────────────────────────
-    if (slam_worker_)  slam_worker_->push(frame);
-    if (disp_worker_)  disp_worker_->push(frame);
-    if (prev_worker_)  prev_worker_->push(frame);
+        // ── SLAM path: BayerRG8 → GRAY (fast, single-step) → rectify ──────────
+        // cv::COLOR_BayerRG2GRAY computes a weighted average of the raw Bayer cells,
+        // giving a good luminance estimate without a full 3-channel debayer.
+        cv::Mat left_gray_raw, right_gray_raw;
+        cv::cvtColor(left_raw.image,  left_gray_raw,  cv::COLOR_BayerRG2GRAY);
+        cv::cvtColor(right_raw.image, right_gray_raw, cv::COLOR_BayerRG2GRAY);
+
+        cv::Mat left_gray, right_gray;
+        rectifier_->rectify(left_gray_raw, right_gray_raw, left_gray, right_gray);
+
+        // ── Disparity + Preview path: BayerRG8 → RGB → rectify → CLAHE ────────
+        // One debayer for two consumers (Retinify and Preview share the same images).
+        cv::Mat left_rgb_raw, right_rgb_raw;
+        cv::cvtColor(left_raw.image,  left_rgb_raw,  cv::COLOR_BayerRG2RGB);
+        cv::cvtColor(right_raw.image, right_rgb_raw, cv::COLOR_BayerRG2RGB);
+
+        cv::Mat left_rgb_rect, right_rgb_rect;
+        rectifier_->rectify(left_rgb_raw, right_rgb_raw, left_rgb_rect, right_rgb_rect);
+
+        // Apply CLAHE in CIE Lab L-channel to the rectified RGB image
+        cv::Mat left_rgb  = applyClaheRGB(left_rgb_rect,  clahe_);
+        cv::Mat right_rgb = applyClaheRGB(right_rgb_rect, clahe_);
+
+        // ── Build StereoFrame ─────────────────────────────────────────────────
+        auto frame = std::make_shared<StereoFrame>();
+        frame->left_gray  = std::move(left_gray);
+        frame->right_gray = std::move(right_gray);
+        frame->left_rgb   = std::move(left_rgb);
+        frame->right_rgb  = std::move(right_rgb);
+
+        // Integer timestamp — no floating-point round-trip
+        frame->timestamp_ns  = left_raw.timestamp_ns;
+        frame->timestamp_sec = static_cast<double>(left_raw.timestamp_ns) * 1e-9;
+        frame->stamp = rclcpp::Time(
+            static_cast<int32_t>(left_raw.timestamp_ns / 1'000'000'000ULL),
+            static_cast<uint32_t>(left_raw.timestamp_ns % 1'000'000'000ULL));
+        frame->frame_id = left_raw.frame_id;
+
+        // ── Dispatch to workers ───────────────────────────────────────────────
+        if (slam_worker_)  slam_worker_->push(frame);
+        if (disp_worker_)  disp_worker_->push(frame);
+        if (prev_worker_)  prev_worker_->push(frame);
+    }
 }
 
 void PassiveStereoNode::onSlamReset(

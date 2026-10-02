@@ -5,7 +5,7 @@
 #include <chrono>
 #include <iostream>
 
-#include <opencv2/imgproc.hpp>
+#include <rclcpp/rclcpp.hpp>
 
 using namespace Spinnaker;
 using namespace Spinnaker::GenApi;
@@ -14,7 +14,7 @@ namespace passive_stereo_capture
 {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers
+// GenICam helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 static CameraPtr findCameraBySerial(
@@ -84,7 +84,7 @@ SpinnakerGrabber::~SpinnakerGrabber() { stop(); }
 
 void SpinnakerGrabber::configureCamera(CameraPtr cam, bool /*is_left*/)
 {
-    // ── Pixel format ──────────────────────────────────────────────────────────
+    // ── Pixel format — keep as raw Bayer ─────────────────────────────────────
     setEnum(cam, "PixelFormat", "BayerRG8");
 
     // ── Binning ───────────────────────────────────────────────────────────────
@@ -126,10 +126,8 @@ void SpinnakerGrabber::configureCamera(CameraPtr cam, bool /*is_left*/)
 
     // ── Trigger ───────────────────────────────────────────────────────────────
     if (cfg_.trigger_mode) {
-        // Line3 as input (hardware trigger from Jetson GPIO)
         setEnum(cam, "LineSelector",  "Line3");
         setEnum(cam, "LineMode",      "Input");
-
         setEnum(cam, "TriggerSelector", "FrameStart");
         setEnum(cam, "TriggerSource",   "Line3");
         setEnum(cam, "TriggerOverlap",  "ReadOut");
@@ -191,36 +189,35 @@ void SpinnakerGrabber::stop()
 
 void SpinnakerGrabber::grabThread(CameraPtr cam, bool is_left)
 {
-    // Spinnaker ImageProcessor for Bayer -> RGB8 conversion
-    ImageProcessor proc;
-    proc.SetColorProcessing(SPINNAKER_COLOR_PROCESSING_ALGORITHM_HQ_LINEAR);
+    int consecutive_errors = 0;
 
     while (running_.load()) {
         try {
             ImagePtr raw = cam->GetNextImage(cfg_.acquire_timeout_ms);
+
             if (raw->IsIncomplete()) {
                 raw->Release();
+                std::cerr << "SpinnakerGrabber: incomplete frame on "
+                          << (is_left ? "left" : "right") << "\n";
                 continue;
             }
 
-            // Convert BayerRG8 -> RGB8 using Spinnaker processor
-            ImagePtr rgb = proc.Convert(raw, PixelFormat_RGB8);
+            // Read chunk data from the RAW image BEFORE any processing.
+            // ChunkData lives on the raw Bayer frame.
+            ChunkData chunk  = raw->GetChunkData();
+            uint64_t  fid    = static_cast<uint64_t>(chunk.GetFrameID());
+            uint64_t  ts_ns  = static_cast<uint64_t>(chunk.GetTimestamp()); // nanoseconds
+
+            // Deep-copy raw BayerRG8 pixel data into a CV_8UC1 Mat.
+            // No conversion — consumers decide how to decode (Gray for SLAM, RGB for Retinify).
+            int w = static_cast<int>(raw->GetWidth());
+            int h = static_cast<int>(raw->GetHeight());
+            cv::Mat bayer(h, w, CV_8UC1);
+            std::memcpy(bayer.data, raw->GetData(), static_cast<size_t>(w * h));
             raw->Release();
 
-            // Wrap pixel data into cv::Mat (deep copy, since rgb will be released)
-            int w = static_cast<int>(rgb->GetWidth());
-            int h = static_cast<int>(rgb->GetHeight());
-            cv::Mat mat(h, w, CV_8UC3);
-            std::memcpy(mat.data, rgb->GetData(), static_cast<size_t>(w * h * 3));
-
-            // Chunk data
-            ChunkData chunk = rgb->GetChunkData();
-            uint64_t fid    = static_cast<uint64_t>(chunk.GetFrameID());
-            // Spinnaker timestamp in nanoseconds
-            double ts_sec   = static_cast<double>(chunk.GetTimestamp()) * 1e-9;
-            rgb->Release();
-
-            RawFrame frame{std::move(mat), fid, ts_sec};
+            RawFrame frame{std::move(bayer), fid, ts_ns};
+            consecutive_errors = 0;
 
             if (is_left) {
                 std::lock_guard<std::mutex> lock(left_mtx_);
@@ -235,9 +232,23 @@ void SpinnakerGrabber::grabThread(CameraPtr cam, bool is_left)
             }
 
         } catch (const Spinnaker::Exception & e) {
-            if (running_.load()) {
-                std::cerr << "Grab error (" << (is_left ? "left" : "right")
-                          << "): " << e.what() << "\n";
+            if (!running_.load()) break;
+
+            ++consecutive_errors;
+            std::cerr << "SpinnakerGrabber grab error ["
+                      << (is_left ? "left" : "right") << "] "
+                      << consecutive_errors << "/" << cfg_.max_consecutive_errors
+                      << ": " << e.what() << "\n";
+
+            if (consecutive_errors >= cfg_.max_consecutive_errors) {
+                std::cerr << "SpinnakerGrabber: camera "
+                          << (is_left ? "left" : "right")
+                          << " appears disconnected — triggering shutdown!\n";
+                running_.store(false);
+                left_cv_.notify_all();
+                right_cv_.notify_all();
+                rclcpp::shutdown();
+                break;
             }
         }
     }
@@ -246,7 +257,6 @@ void SpinnakerGrabber::grabThread(CameraPtr cam, bool is_left)
 void SpinnakerGrabber::syncThread()
 {
     while (running_.load()) {
-        // Wait for left frame
         RawFrame left_frame;
         {
             std::unique_lock<std::mutex> lock(left_mtx_);
@@ -258,7 +268,6 @@ void SpinnakerGrabber::syncThread()
             left_queue_.pop();
         }
 
-        // Find matching right frame by FrameID
         RawFrame right_frame;
         bool matched = false;
         for (int attempt = 0; attempt < 20 && running_.load(); ++attempt) {
@@ -277,16 +286,16 @@ void SpinnakerGrabber::syncThread()
                     matched = true;
                     break;
                 } else if (diff < 0) {
-                    // Right is behind: discard right and fetch newer
-                    right_queue_.pop();
+                    right_queue_.pop();  // right is behind — discard and fetch newer
                 } else {
-                    // Right is ahead: left was probably dropped, skip left
-                    break;
+                    break;              // right is ahead — left was dropped, move on
                 }
             }
             if (matched) break;
         }
 
+        // Non-blocking callback: pushes to preprocess queue and returns immediately.
+        // Heavy work (debayer, rectify, CLAHE) is done in PassiveStereoNode::preprocessThread().
         if (matched && callback_) {
             callback_(left_frame, right_frame);
         }

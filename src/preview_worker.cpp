@@ -40,35 +40,36 @@ void PreviewWorker::stop()
     if (thread_.joinable()) thread_.join();
 }
 
-static sensor_msgs::msg::CompressedImage encodeJpeg(
+void PreviewWorker::encodeAndPublish(
     const cv::Mat & rgb_img,
-    int width, int height, int quality,
+    Publisher & pub,
+    std::vector<uchar> & buf,
     const rclcpp::Time & stamp,
     const std::string & frame_id)
 {
-    // Convert RGB8 → BGR8 for OpenCV imencode
-    cv::Mat bgr;
-    cv::cvtColor(rgb_img, bgr, cv::COLOR_RGB2BGR);
-
-    // Resize
+    // FIX #10: Resize first (cheaper when smaller), then convert color.
+    // Avoids a full-res RGB->BGR copy before resizing.
     cv::Mat resized;
-    if (bgr.cols != width || bgr.rows != height) {
-        cv::resize(bgr, resized, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
+    if (rgb_img.cols != preview_width_ || rgb_img.rows != preview_height_) {
+        cv::resize(rgb_img, resized, cv::Size(preview_width_, preview_height_),
+                   0, 0, cv::INTER_LINEAR);
     } else {
-        resized = bgr;
+        resized = rgb_img;
     }
 
-    // JPEG encode
-    std::vector<uchar> buf;
-    cv::imencode(".jpg", resized, buf,
-                 {cv::IMWRITE_JPEG_QUALITY, quality});
+    // Convert RGB8 → BGR8 for OpenCV imencode (JPEG codec expects BGR)
+    cv::Mat bgr;
+    cv::cvtColor(resized, bgr, cv::COLOR_RGB2BGR);
+
+    // FIX #10: buf is a member variable — cv::imencode reuses its allocation.
+    cv::imencode(".jpg", bgr, buf, {cv::IMWRITE_JPEG_QUALITY, jpeg_quality_});
 
     sensor_msgs::msg::CompressedImage msg;
     msg.header.stamp    = stamp;
     msg.header.frame_id = frame_id;
     msg.format          = "jpeg";
-    msg.data            = std::move(buf);
-    return msg;
+    msg.data            = buf;   // copy into message (ROS 2 publish owns the data)
+    pub->publish(msg);
 }
 
 void PreviewWorker::run()
@@ -77,13 +78,10 @@ void PreviewWorker::run()
         StereoFramePtr frame;
         if (!queue_.pop(frame)) continue;
 
-        auto left_msg  = encodeJpeg(frame->left,  preview_width_, preview_height_,
-                                    jpeg_quality_, frame->stamp, "left_camera_link");
-        auto right_msg = encodeJpeg(frame->right, preview_width_, preview_height_,
-                                    jpeg_quality_, frame->stamp, "right_camera_link");
-
-        pub_left_->publish(left_msg);
-        pub_right_->publish(right_msg);
+        encodeAndPublish(frame->left_rgb,  pub_left_,  buf_left_,
+                         frame->stamp, "Passive/left_camera_link");
+        encodeAndPublish(frame->right_rgb, pub_right_, buf_right_,
+                         frame->stamp, "Passive/right_camera_link");
     }
 }
 

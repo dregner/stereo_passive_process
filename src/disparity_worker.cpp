@@ -4,6 +4,10 @@
 #include <cmath>
 #include <cstring>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace passive_stereo_capture
 {
 
@@ -62,20 +66,22 @@ bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
     auto status = pipeline_.Initialize(W, H, retinify::PixelFormat::RGB8, mode, calib);
     if (!status.IsOK()) return false;
 
-    size_t disp_bytes = W * H * sizeof(float);
+    // ── Disparity pinned buffer ───────────────────────────────────────────────
+    size_t disp_bytes = static_cast<size_t>(W) * H * sizeof(float);
     if (pinned_disp_bytes_ < disp_bytes) {
-        if (h_pinned_disp_) cudaFreeHost(h_pinned_disp_);
-        if (cudaHostAlloc(&h_pinned_disp_, disp_bytes, cudaHostAllocDefault) != cudaSuccess) {
-            h_pinned_disp_ = nullptr;
-            cpu_disp_buf_.resize(W * H);
-        } else {
+        if (h_pinned_disp_) { cudaFreeHost(h_pinned_disp_); h_pinned_disp_ = nullptr; }
+        if (cudaHostAlloc(&h_pinned_disp_, disp_bytes, cudaHostAllocDefault) == cudaSuccess) {
             pinned_disp_bytes_ = disp_bytes;
+        } else {
+            h_pinned_disp_ = nullptr;
+            cpu_disp_buf_.resize(static_cast<size_t>(W) * H);
         }
     }
 
-    size_t xyz_bytes = W * H * 3 * sizeof(float);
+    // ── XYZ pinned buffer ─────────────────────────────────────────────────────
+    size_t xyz_bytes = static_cast<size_t>(W) * H * 3 * sizeof(float);
     if (pinned_xyz_bytes_ < xyz_bytes) {
-        if (h_pinned_xyz_) cudaFreeHost(h_pinned_xyz_);
+        if (h_pinned_xyz_) { cudaFreeHost(h_pinned_xyz_); h_pinned_xyz_ = nullptr; }
         if (cudaHostAlloc(&h_pinned_xyz_, xyz_bytes, cudaHostAllocDefault) != cudaSuccess) {
             h_pinned_xyz_ = nullptr;
             return false;
@@ -83,10 +89,15 @@ bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
         pinned_xyz_bytes_ = xyz_bytes;
     }
 
+    // FIX #9: pre-allocate compact-cloud work buffer and PointCloud2 data at max size
     size_t pt_size = cfg_.publish_confidence ?
         sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
-    cpu_point_buf_.resize(static_cast<size_t>(W) * H * pt_size);
+    size_t max_pts = static_cast<size_t>(W) * H;
+    cpu_point_buf_.resize(max_pts * pt_size);
+    cloud_data_buf_.resize(max_pts * pt_size);  // reused PointCloud2 message data
 
+    pipeline_W_ = W;
+    pipeline_H_ = H;
     pipeline_init_ = true;
     return true;
 }
@@ -100,18 +111,38 @@ size_t DisparityWorker::compactCloud(
     const float * disp, int disp_step,
     int conf_radius, float conf_alpha, float min_conf)
 {
-    size_t count = 0;
-    auto * dst_rgb  = reinterpret_cast<PointXYZRGB *>(out_buf);
-    auto * dst_conf = reinterpret_cast<PointXYZRGBConf *>(out_buf);
+    // FIX #7: parallelize row loop with OpenMP
+    const size_t pt_size = with_conf ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
+    int rows = (v1 - v0 + step - 1) / step;
 
-    for (int v = v0; v < v1; v += step) {
+    // Per-thread local buffers collected after the parallel loop
+    std::vector<std::vector<uint8_t>> thread_bufs;
+#ifdef _OPENMP
+    const int n_threads = omp_get_max_threads();
+#else
+    const int n_threads = 1;
+#endif
+    thread_bufs.resize(n_threads);
+    for (auto & b : thread_bufs) b.reserve((static_cast<size_t>(rows) * pt_size) / n_threads + 1);
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 4) num_threads(n_threads)
+#endif
+    for (int vi = 0; vi < rows; ++vi) {
+        int v = v0 + vi * step;
+#ifdef _OPENMP
+        int tid = omp_get_thread_num();
+#else
+        int tid = 0;
+#endif
+        auto & lbuf = thread_bufs[tid];
+
         const float   * xyz_row = xyz + v * static_cast<int>(W) * 3;
         const uint8_t * img_row = img_rgb + v * img_step;
 
         for (int u = u0; u < u1; u += step) {
             float X = xyz_row[u*3+0], Y = xyz_row[u*3+1], Z = xyz_row[u*3+2];
             if (Z <= 0.f) continue;
-
             if (max_dist_sq > 0.f && (X*X + Y*Y + Z*Z) > max_dist_sq) continue;
 
             float conf = 1.f;
@@ -130,7 +161,7 @@ size_t DisparityWorker::compactCloud(
                     }
                 }
                 if (nb > 1) {
-                    float mean = sum / nb;
+                    float mean  = sum / nb;
                     float sigma = std::sqrt(std::max((sum_sq/nb) - mean*mean, 0.f));
                     conf = 1.f / (1.f + conf_alpha * sigma);
                     if (conf < min_conf) continue;
@@ -140,11 +171,26 @@ size_t DisparityWorker::compactCloud(
             uint8_t r = img_row[u*3+0], g = img_row[u*3+1], b = img_row[u*3+2];
             uint32_t rgb = (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
 
-            if (with_conf) dst_conf[count++] = {X, Y, Z, rgb, conf};
-            else           dst_rgb [count++] = {X, Y, Z, rgb};
+            if (with_conf) {
+                PointXYZRGBConf pt{X, Y, Z, rgb, conf};
+                const uint8_t * src = reinterpret_cast<const uint8_t *>(&pt);
+                lbuf.insert(lbuf.end(), src, src + sizeof(pt));
+            } else {
+                PointXYZRGB pt{X, Y, Z, rgb};
+                const uint8_t * src = reinterpret_cast<const uint8_t *>(&pt);
+                lbuf.insert(lbuf.end(), src, src + sizeof(pt));
+            }
         }
     }
-    return count;
+
+    // Merge thread-local buffers into out_buf
+    size_t total = 0;
+    auto * dst = reinterpret_cast<uint8_t *>(out_buf);
+    for (auto & b : thread_bufs) {
+        std::memcpy(dst + total, b.data(), b.size());
+        total += b.size();
+    }
+    return total / pt_size;
 }
 
 void DisparityWorker::run()
@@ -153,36 +199,40 @@ void DisparityWorker::run()
         StereoFramePtr frame;
         if (!queue_.pop(frame)) continue;
 
-        uint32_t W = static_cast<uint32_t>(frame->left.cols);
-        uint32_t H = static_cast<uint32_t>(frame->left.rows);
+        uint32_t W = static_cast<uint32_t>(frame->left_rgb.cols);
+        uint32_t H = static_cast<uint32_t>(frame->left_rgb.rows);
 
-        if (!pipeline_init_) {
+        // FIX (medium #15): re-initialize if resolution changes
+        if (!pipeline_init_ || pipeline_W_ != W || pipeline_H_ != H) {
             if (!initPipeline(W, H)) {
                 RCLCPP_ERROR(rclcpp::get_logger("disparity_worker"),
-                             "Failed to initialise Retinify pipeline!");
+                             "Failed to initialise Retinify pipeline for %ux%u!", W, H);
                 continue;
             }
         }
 
         auto status = pipeline_.Execute(
-            frame->left.ptr<uint8_t>(),  frame->left.step[0],
-            frame->right.ptr<uint8_t>(), frame->right.step[0]);
+            frame->left_rgb.ptr<uint8_t>(),  frame->left_rgb.step[0],
+            frame->right_rgb.ptr<uint8_t>(), frame->right_rgb.step[0]);
         if (!status.IsOK()) continue;
 
         // Retrieve disparity for confidence gating
         float * disp_ptr = h_pinned_disp_ ? h_pinned_disp_ : cpu_disp_buf_.data();
+        // FIX #4: Second arg is the stride (bytes per row) = W * sizeof(float)
         auto disp_status = pipeline_.RetrieveDisparity(disp_ptr, W * sizeof(float));
         if (!disp_status.IsOK()) continue;
 
-        // Retrieve dense XYZ point cloud from GPU
+        // Retrieve dense XYZ from GPU
+        // FIX #4: second arg is total buffer size in bytes
         if (!h_pinned_xyz_) continue;
-        auto pc_status = pipeline_.RetrievePointCloud(h_pinned_xyz_, W * 3 * sizeof(float));
+        auto pc_status = pipeline_.RetrievePointCloud(
+            h_pinned_xyz_, static_cast<size_t>(W) * H * 3 * sizeof(float));
         if (!pc_status.IsOK()) continue;
 
         // Sampling / crop parameters
-        float sampling = static_cast<float>(std::clamp(cfg_.sampling_factor, 0.01, 1.0));
-        int   step_px  = std::max(1, static_cast<int>(1.f / sampling));
-        double crop    = std::clamp(cfg_.crop_factor, 0.01, 1.0);
+        float  sampling = static_cast<float>(std::clamp(cfg_.sampling_factor, 0.01, 1.0));
+        int    step_px  = std::max(1, static_cast<int>(1.f / sampling));
+        double crop     = std::clamp(cfg_.crop_factor, 0.01, 1.0);
         int cw = static_cast<int>(W * crop), ch = static_cast<int>(H * crop);
         int u0 = (static_cast<int>(W) - cw) / 2, v0 = (static_cast<int>(H) - ch) / 2;
         int u1 = u0 + cw, v1 = v0 + ch;
@@ -190,19 +240,23 @@ void DisparityWorker::run()
             static_cast<float>(cfg_.max_dist * cfg_.max_dist) : -1.f;
 
         bool wconf = cfg_.publish_confidence;
-        uint32_t pt_step = wconf ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
 
         size_t valid = compactCloud(
-            h_pinned_xyz_, frame->left.ptr<uint8_t>(),
+            h_pinned_xyz_, frame->left_rgb.ptr<uint8_t>(),
             W, H, u0, v0, u1, v1, step_px,
-            mdsq, static_cast<int>(frame->left.step[0]),
+            mdsq, static_cast<int>(frame->left_rgb.step[0]),
             cpu_point_buf_.data(), wconf,
             disp_ptr, static_cast<int>(W * sizeof(float)),
             cfg_.confidence_radius,
             static_cast<float>(cfg_.confidence_alpha),
             static_cast<float>(cfg_.min_confidence));
 
-        // Build and publish PointCloud2
+        if (valid == 0) continue;
+
+        // FIX #9: Build PointCloud2 using pre-allocated buffer — no heap alloc on hot path
+        uint32_t pt_step = wconf ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
+        size_t   data_sz = valid * pt_step;
+
         auto cloud = std::make_unique<sensor_msgs::msg::PointCloud2>();
         cloud->header.stamp    = frame->stamp;
         cloud->header.frame_id = cfg_.frame_id;
@@ -228,11 +282,16 @@ void DisparityWorker::run()
         }
         cloud->point_step = pt_step;
         cloud->row_step   = cloud->width * pt_step;
-        cloud->data.resize(cloud->row_step);
-        if (valid > 0)
-            std::memcpy(cloud->data.data(), cpu_point_buf_.data(), cloud->row_step);
+
+        // Swap pre-allocated buffer into message data (avoids copy)
+        cloud_data_buf_.resize(data_sz);
+        std::memcpy(cloud_data_buf_.data(), cpu_point_buf_.data(), data_sz);
+        cloud->data = std::move(cloud_data_buf_);
 
         pub_cloud_->publish(std::move(cloud));
+
+        // Reclaim the moved buffer (it was cleared by the move)
+        cloud_data_buf_.reserve(static_cast<size_t>(W) * H * pt_step);
     }
 }
 

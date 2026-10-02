@@ -21,7 +21,7 @@ namespace passive_stereo_capture
 {
 
 /// Runs the Retinify GPU stereo depth pipeline in a dedicated thread.
-/// Input: rectified RGB8 stereo pair (already processed by StereoRectifier + CLAHE).
+/// Input: rectified RGB8 stereo pair (left/right — with CLAHE applied).
 /// Output: dense coloured PointCloud2 published to ROS 2.
 class DisparityWorker
 {
@@ -75,13 +75,19 @@ private:
 
     retinify::Pipeline pipeline_;
     bool               pipeline_init_{false};
+    uint32_t           pipeline_W_{0};  // cached pipeline width — detect resolution changes
+    uint32_t           pipeline_H_{0};
 
     float * h_pinned_disp_{nullptr};
     size_t  pinned_disp_bytes_{0};
     float * h_pinned_xyz_{nullptr};
     size_t  pinned_xyz_bytes_{0};
     std::vector<float>   cpu_disp_buf_;
+
+    // FIX #9: Pre-allocated point output buffer (reused every frame)
     std::vector<uint8_t> cpu_point_buf_;
+    // FIX #9: Pre-allocated, reused PointCloud2 message data buffer
+    std::vector<uint8_t> cloud_data_buf_;
 
     BoundedQueue<StereoFramePtr> queue_{1, /*drop_oldest=*/true};
     std::thread      thread_;
