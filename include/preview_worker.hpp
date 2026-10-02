@@ -28,7 +28,8 @@ public:
         Publisher pub_right,
         int preview_width,
         int preview_height,
-        int jpeg_quality);
+        int jpeg_quality,
+        double max_fps = 10.0);
 
     ~PreviewWorker();
 
@@ -41,9 +42,9 @@ public:
 private:
     void run();
     void encodeAndPublish(
-        const cv::Mat & rgb_img,
+        const cv::Mat & bgr_img,
         Publisher & pub,
-        std::vector<uchar> & buf,          ///< Reused encode buffer (FIX #10)
+        std::vector<uchar> & buf,
         const rclcpp::Time & stamp,
         const std::string & frame_id);
 
@@ -52,6 +53,10 @@ private:
     int preview_width_;
     int preview_height_;
     int jpeg_quality_;
+    double max_fps_{10.0};
+
+    rclcpp::Time last_pub_time_{0, 0, RCL_ROS_TIME};
+    bool last_pub_time_init_{false};
 
     // FIX #10: persistent encode buffers — cv::imencode reuses allocation
     std::vector<uchar> buf_left_;

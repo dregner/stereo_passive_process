@@ -88,6 +88,7 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("preview_width",    612);
     declare_parameter("preview_height",   512);
     declare_parameter("preview_quality",  50);
+    declare_parameter("preview_fps",      10.0);   ///< Max framerate for preview publishing (e.g. 10 Hz)
 
     declare_parameter("namespace",        std::string("Passive"));
 }
@@ -187,13 +188,15 @@ void PassiveStereoNode::init()
         auto pub_right = create_publisher<sensor_msgs::msg::CompressedImage>(
             mk("right/preview/image/compressed"), best_effort_qos);
 
-        int pw = get_parameter("preview_width").as_int();
-        int ph = get_parameter("preview_height").as_int();
-        int pq = get_parameter("preview_quality").as_int();
+        int    pw  = get_parameter("preview_width").as_int();
+        int    ph  = get_parameter("preview_height").as_int();
+        int    pq  = get_parameter("preview_quality").as_int();
+        double pfps = get_parameter("preview_fps").as_double();
 
-        prev_worker_ = std::make_unique<PreviewWorker>(pub_left, pub_right, pw, ph, pq);
+        prev_worker_ = std::make_unique<PreviewWorker>(pub_left, pub_right, pw, ph, pq, pfps);
         prev_worker_->start();
-        RCLCPP_INFO(get_logger(), "Preview worker started (%dx%d, q=%d)", pw, ph, pq);
+        RCLCPP_INFO(get_logger(), "Preview worker started (%dx%d, q=%d, max_fps=%.1f)",
+            pw, ph, pq, pfps);
     }
 
     // ── GPIO Trigger ───────────────────────────────────────────────────────────
@@ -267,8 +270,7 @@ void PassiveStereoNode::preprocessThread()
         cv::Mat left_gray, right_gray;
         rectifier_->rectify(left_gray_raw, right_gray_raw, left_gray, right_gray);
 
-        // ── Disparity + Preview path: BayerRG8 → RGB → rectify → CLAHE ────────
-        // One debayer for two consumers (Retinify and Preview share the same images).
+        // ── Disparity path: BayerRG8 → RGB → rectify → CLAHE ─────────────────
         cv::Mat left_rgb_raw, right_rgb_raw;
         cv::cvtColor(left_raw.image,  left_rgb_raw,  cv::COLOR_BayerRG2RGB);
         cv::cvtColor(right_raw.image, right_rgb_raw, cv::COLOR_BayerRG2RGB);
@@ -280,12 +282,21 @@ void PassiveStereoNode::preprocessThread()
         cv::Mat left_rgb  = applyClaheRGB(left_rgb_rect,  clahe_);
         cv::Mat right_rgb = applyClaheRGB(right_rgb_rect, clahe_);
 
+        // ── Preview path: BayerRG8 → BGR8 (unrectified, native ROS 2 color space) ──
+        cv::Mat left_raw_bgr, right_raw_bgr;
+        if (prev_enabled_) {
+            cv::cvtColor(left_raw.image,  left_raw_bgr,  cv::COLOR_BayerRG2BGR);
+            cv::cvtColor(right_raw.image, right_raw_bgr, cv::COLOR_BayerRG2BGR);
+        }
+
         // ── Build StereoFrame ─────────────────────────────────────────────────
         auto frame = std::make_shared<StereoFrame>();
-        frame->left_gray  = std::move(left_gray);
-        frame->right_gray = std::move(right_gray);
-        frame->left_rgb   = std::move(left_rgb);
-        frame->right_rgb  = std::move(right_rgb);
+        frame->left_gray     = std::move(left_gray);
+        frame->right_gray    = std::move(right_gray);
+        frame->left_rgb      = std::move(left_rgb);
+        frame->right_rgb     = std::move(right_rgb);
+        frame->left_raw_bgr  = std::move(left_raw_bgr);  // Unrectified BGR8 for ROS 2 preview
+        frame->right_raw_bgr = std::move(right_raw_bgr); // Unrectified BGR8 for ROS 2 preview
 
         // Integer timestamp — no floating-point round-trip
         frame->timestamp_ns  = left_raw.timestamp_ns;

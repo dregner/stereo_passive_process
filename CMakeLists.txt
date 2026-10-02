@@ -41,7 +41,13 @@ endif()
 find_package(retinify REQUIRED)
 
 # ---- Spinnaker SDK --------------------------------------------------------
-set(SPINNAKER_ROOT "/opt/spinnaker")
+if(NOT DEFINED SPINNAKER_ROOT)
+  if(DEFINED ENV{SPINNAKER_ROOT})
+    set(SPINNAKER_ROOT "$ENV{SPINNAKER_ROOT}")
+  else()
+    set(SPINNAKER_ROOT "/opt/spinnaker")
+  endif()
+endif()
 if(NOT EXISTS "${SPINNAKER_ROOT}/include/Spinnaker.h")
   message(FATAL_ERROR "Spinnaker SDK not found at ${SPINNAKER_ROOT}")
 endif()
@@ -52,7 +58,15 @@ set_target_properties(Spinnaker::Spinnaker PROPERTIES
 )
 
 # ---- ORB-SLAM3 ------------------------------------------------------------
-set(ORB_SLAM3_ROOT "/home/daniel/ORB_SLAM3")
+if(NOT DEFINED ORB_SLAM3_ROOT)
+  if(DEFINED ENV{ORB_SLAM3_ROOT})
+    set(ORB_SLAM3_ROOT "$ENV{ORB_SLAM3_ROOT}")
+  elseif(EXISTS "/home/jetson/ORB_SLAM3")
+    set(ORB_SLAM3_ROOT "/home/jetson/ORB_SLAM3")
+  else()
+    set(ORB_SLAM3_ROOT "/home/daniel/ORB_SLAM3")
+  endif()
+endif()
 if(NOT EXISTS "${ORB_SLAM3_ROOT}/include/System.h")
   message(FATAL_ERROR "ORB-SLAM3 not found at ${ORB_SLAM3_ROOT}")
 endif()
@@ -147,9 +161,50 @@ target_link_libraries(passive_stereo_node
   Eigen3::Eigen
 )
 
-# DT_RPATH so the binary finds libORB_SLAM3.so and libSpinnaker.so at runtime
+
+# ── RPATH configuration ──────────────────────────────────────────────────
+# Ensure installed binary finds non-system libraries:
+# 1. ORB-SLAM3 and thirdparty libs (DBoW2, g2o)
+# 2. Spinnaker SDK
+# 3. Pangolin (found either in system, /usr/local/lib, or ORB-SLAM3/Thirdparty/Pangolin/build)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+set(RPATH_DIRS
+  "${ORB_SLAM3_ROOT}/lib"
+  "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib"
+  "${ORB_SLAM3_ROOT}/Thirdparty/g2o/lib"
+  "${ORB_SLAM3_ROOT}/Thirdparty/Pangolin/build"
+  "${SPINNAKER_ROOT}/lib"
+  "/usr/local/lib"
+)
+
+if(DEFINED Pangolin_DIR)
+  get_filename_component(_pango_dir "${Pangolin_DIR}" DIRECTORY)
+  list(APPEND RPATH_DIRS "${Pangolin_DIR}" "${_pango_dir}" "${_pango_dir}/lib")
+endif()
+
+# Check each library in Pangolin_LIBRARIES
+foreach(_p_lib IN LISTS Pangolin_LIBRARIES)
+  if(TARGET "${_p_lib}")
+    get_target_property(_loc "${_p_lib}" IMPORTED_LOCATION_RELEASE)
+    if(NOT _loc)
+      get_target_property(_loc "${_p_lib}" IMPORTED_LOCATION)
+    endif()
+    if(_loc)
+      get_filename_component(_d "${_loc}" DIRECTORY)
+      list(APPEND RPATH_DIRS "${_d}")
+    endif()
+  elseif(EXISTS "${_p_lib}")
+    get_filename_component(_d "${_p_lib}" DIRECTORY)
+    list(APPEND RPATH_DIRS "${_d}")
+  endif()
+endforeach()
+
+list(REMOVE_DUPLICATES RPATH_DIRS)
+message(STATUS "passive_stereo_capture RPATH_DIRS: ${RPATH_DIRS}")
+
 set_target_properties(passive_stereo_node PROPERTIES
-  INSTALL_RPATH "${ORB_SLAM3_ROOT}/lib;${SPINNAKER_ROOT}/lib"
+  INSTALL_RPATH "${RPATH_DIRS}"
   BUILD_WITH_INSTALL_RPATH TRUE
 )
 

@@ -66,8 +66,9 @@ passive_stereo_node:
     publish_confidence: true
     disp_frame_id:    "Passive/left_camera_link"
 
-    # ---- Preview streaming -----------------------------------------------
+    # ---- Preview streaming (unrectified raw perspective) ----------------
     preview_enabled: true
     preview_width:   612
     preview_height:  512
     preview_quality: 50    # JPEG quality 0-100
+    preview_fps:     10.0  # Max publishing rate for preview (e.g. 10.0 Hz)
