@@ -31,12 +31,15 @@ SlamWorker::SlamWorker(
     tf_listener_    = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(node_);
 
-    // Initialise ORB-SLAM3
-    slam_ = new ORB_SLAM3::System(
+    slam_.reset(new ORB_SLAM3::System(
         cfg_.voc_file,
         cfg_.settings_file,
         ORB_SLAM3::System::STEREO,
-        cfg_.use_pangolin);
+        cfg_.use_pangolin));
+
+    // Grayscale CLAHE applied after resize (small image — efficient)
+    clahe_gray_ = cv::createCLAHE(cfg_.clahe_clip,
+                                   cv::Size(cfg_.clahe_tiles, cfg_.clahe_tiles));
 
     RCLCPP_INFO(node_->get_logger(), "SlamWorker: ORB-SLAM3 initialised");
 }
@@ -44,10 +47,7 @@ SlamWorker::SlamWorker(
 SlamWorker::~SlamWorker()
 {
     stop();
-    if (slam_) {
-        slam_->Shutdown();
-        delete slam_;
-    }
+    // unique_ptr destructor calls SlamDeleter → Shutdown() + delete
 }
 
 void SlamWorker::push(StereoFramePtr frame) { queue_.push(std::move(frame)); }
@@ -68,11 +68,8 @@ void SlamWorker::stop()
 
 void SlamWorker::reset()
 {
-    if (slam_) {
-        slam_->Reset();
-        slam_->ResetActiveMap();
-        initial_offset_set_ = false;
-    }
+    // Safe: just set atomic flag; run() applies it at the top of its loop
+    reset_requested_.store(true);
 }
 
 void SlamWorker::tryLookupTf()
@@ -87,8 +84,10 @@ void SlamWorker::tryLookupTf()
             "SlamWorker: TF [%s -> %s] cached",
             cfg_.parent_frame_id.c_str(), cfg_.child_frame_id.c_str());
     } catch (const tf2::TransformException & ex) {
-        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 3000,
-            "SlamWorker: waiting for TF: %s", ex.what());
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+            "SlamWorker: TF [%s -> %s] not yet available; publishing pose in "
+            "camera frame until TF arrives: %s",
+            cfg_.parent_frame_id.c_str(), cfg_.child_frame_id.c_str(), ex.what());
     }
 }
 
@@ -108,39 +107,46 @@ tf2::Transform SlamWorker::sophusToTf(const Sophus::SE3f & pose)
 }
 
 void SlamWorker::publishPose(
-    const Sophus::SE3f & se3, const rclcpp::Time & stamp)
+    const Sophus::SE3f & se3, const rclcpp::Time & stamp, int state)
 {
-    if (!tf_cached_) return;
+    tf2::Transform T_map_cam = sophusToTf(se3.inverse());
 
-    // map -> camera from SLAM (inverse of tracked pose)
-    tf2::Transform T_map_cam   = sophusToTf(se3.inverse());
-    tf2::Transform T_cam_base  = T_base_cam_.inverse();
-    tf2::Transform T_map_base  = T_map_cam * T_cam_base;
+    tf2::Transform T_zeroed;
+    if (tf_cached_) {
+        tf2::Transform T_cam_base = T_base_cam_.inverse();
+        tf2::Transform T_map_base = T_map_cam * T_cam_base;
 
-    if (!initial_offset_set_) {
-        initial_offset_.setIdentity();
-        initial_offset_.setOrigin(T_map_base.getOrigin());
-        initial_offset_set_ = true;
+        if (!initial_offset_set_) {
+            initial_offset_.setIdentity();
+            initial_offset_.setOrigin(T_map_base.getOrigin());
+            initial_offset_set_ = true;
+        }
+        T_zeroed = initial_offset_.inverse() * T_map_base;
+    } else {
+        // TF not yet available — publish raw ENU pose in map frame
+        if (!initial_offset_set_) {
+            initial_offset_.setIdentity();
+            initial_offset_.setOrigin(T_map_cam.getOrigin());
+            initial_offset_set_ = true;
+        }
+        T_zeroed = initial_offset_.inverse() * T_map_cam;
     }
-    tf2::Transform T_zeroed = initial_offset_.inverse() * T_map_base;
 
-    // Publish TF if requested
     if (cfg_.tf_publish) {
         geometry_msgs::msg::TransformStamped ts;
         ts.header.stamp    = stamp;
         ts.header.frame_id = cfg_.frame_id;
-        ts.child_frame_id  = cfg_.parent_frame_id;
+        ts.child_frame_id  = tf_cached_ ? cfg_.parent_frame_id : cfg_.child_frame_id;
         tf2::toMsg(T_zeroed, ts.transform);
         tf_broadcaster_->sendTransform(ts);
     }
 
-    // Pose with covariance
     auto msg = std::make_unique<geometry_msgs::msg::PoseWithCovarianceStamped>();
     msg->header.stamp    = stamp;
     msg->header.frame_id = cfg_.frame_id;
     tf2::toMsg(T_zeroed, msg->pose.pose);
 
-    int state = slam_->GetTrackingState();
+ 
     std::fill(msg->pose.covariance.begin(), msg->pose.covariance.end(), 0.0);
     if (state == 2 || state == 5) {
         msg->pose.covariance[0]  = 0.05;
@@ -161,16 +167,29 @@ void SlamWorker::publishPose(
 void SlamWorker::publishCloud(const rclcpp::Time & stamp)
 {
     auto pts = slam_->GetAllMapPoints();
-    int count = 0;
-    for (auto * p : pts) if (p) ++count;
-    if (count == 0) return;
+    std::vector<std::array<float,3>> valid_pts;
+    valid_pts.reserve(pts.size());
+
+    for (auto * p : pts) {
+        if (!p || p->isBad()) continue;
+        Eigen::Vector3f wp = p->GetWorldPos();
+        tf2::Vector3 pt_orb(wp(0), wp(1), wp(2));
+        tf2::Vector3 pt_ros = kOrbToRosEnu * pt_orb;
+        if (tf_cached_) pt_ros = pt_ros + T_base_cam_.getOrigin();
+        valid_pts.push_back({static_cast<float>(pt_ros.x()),
+                             static_cast<float>(pt_ros.y()),
+                             static_cast<float>(pt_ros.z())});
+    }
+
+    if (valid_pts.empty()) return;
 
     auto cloud = std::make_unique<sensor_msgs::msg::PointCloud2>();
     cloud->header.stamp    = stamp;
     cloud->header.frame_id = cfg_.frame_id;
     cloud->height = 1;
-    cloud->width  = static_cast<uint32_t>(count);
+    cloud->width  = static_cast<uint32_t>(valid_pts.size());
     cloud->is_dense = true;
+    cloud->is_bigendian = false;
     cloud->fields.resize(3);
     for (int i = 0; i < 3; ++i) {
         cloud->fields[i].name     = std::string(1, "xyz"[i]);
@@ -178,26 +197,10 @@ void SlamWorker::publishCloud(const rclcpp::Time & stamp)
         cloud->fields[i].datatype = sensor_msgs::msg::PointField::FLOAT32;
         cloud->fields[i].count    = 1;
     }
-    cloud->point_step    = 12;
-    cloud->row_step      = 12 * count;
-    cloud->is_bigendian  = false;
-    cloud->data.resize(12 * count);
-
-    tf2::Vector3 cam_off = T_base_cam_.getOrigin();
-    int idx = 0;
-    for (auto * p : pts) {
-        if (!p) continue;
-        float x = p->GetWorldPos()(0);
-        float y = p->GetWorldPos()(1);
-        float z = p->GetWorldPos()(2);
-        tf2::Vector3 pt_orb(x, y, z);
-        tf2::Vector3 pt_ros = kOrbToRosEnu * pt_orb + cam_off;
-        float fx = pt_ros.x(), fy = pt_ros.y(), fz = pt_ros.z();
-        std::memcpy(&cloud->data[idx * 12 + 0], &fx, 4);
-        std::memcpy(&cloud->data[idx * 12 + 4], &fy, 4);
-        std::memcpy(&cloud->data[idx * 12 + 8], &fz, 4);
-        ++idx;
-    }
+    cloud->point_step = 12;
+    cloud->row_step   = 12 * cloud->width;
+    cloud->data.resize(cloud->row_step);
+    std::memcpy(cloud->data.data(), valid_pts.data(), cloud->row_step);
     pub_cloud_->publish(std::move(cloud));
 }
 
@@ -207,30 +210,52 @@ void SlamWorker::run()
         StereoFramePtr frame;
         if (!queue_.pop(frame)) continue;
 
-        tryLookupTf();
-
-        // Convert RGB8 -> MONO8
-        cv::Mat left_mono, right_mono;
-        cv::cvtColor(frame->left,  left_mono,  cv::COLOR_RGB2GRAY);
-        cv::cvtColor(frame->right, right_mono, cv::COLOR_RGB2GRAY);
-
-        // Resize to fit within max_width x max_height
-        int W = left_mono.cols, H = left_mono.rows;
-        double scale = std::min(
-            static_cast<double>(cfg_.max_width)  / W,
-            static_cast<double>(cfg_.max_height) / H);
-        if (scale < 1.0) {
-            int nw = static_cast<int>(W * scale);
-            int nh = static_cast<int>(H * scale);
-            cv::resize(left_mono,  left_mono,  cv::Size(nw, nh), 0, 0, cv::INTER_LINEAR);
-            cv::resize(right_mono, right_mono, cv::Size(nw, nh), 0, 0, cv::INTER_LINEAR);
+        // Handle reset safely inside the worker thread (atomic flag set by reset())
+        if (reset_requested_.exchange(false)) {
+            slam_->Reset();
+            slam_->ResetActiveMap();
+            initial_offset_set_ = false;
+            RCLCPP_INFO(node_->get_logger(), "SlamWorker: SLAM reset applied");
         }
 
-        // Track
-        auto se3 = slam_->TrackStereo(left_mono, right_mono, frame->timestamp_sec);
+        tryLookupTf();
 
-        publishPose(se3, frame->stamp);
-        publishCloud(frame->stamp);
+        // SLAM path: receives rectified grayscale (CV_8UC1).
+        // BayerRG2GRAY already done in preprocessThread — no color conversion needed here.
+        // Apply scale_factor directly via cv::resize fractional scaling.
+        cv::Mat left_small, right_small;
+        if (cfg_.scale_factor != 1.0 && cfg_.scale_factor > 0.0) {
+            cv::resize(frame->left_gray,  left_small,  cv::Size(), cfg_.scale_factor, cfg_.scale_factor, cv::INTER_LINEAR);
+            cv::resize(frame->right_gray, right_small, cv::Size(), cfg_.scale_factor, cfg_.scale_factor, cv::INTER_LINEAR);
+        } else {
+            left_small  = frame->left_gray;
+            right_small = frame->right_gray;
+        }
+
+        // Apply CLAHE on the small grayscale image — efficient (small resolution)
+        clahe_gray_->apply(left_small,  left_small);
+        clahe_gray_->apply(right_small, right_small);
+
+        // Track
+        auto se3  = slam_->TrackStereo(left_small, right_small, frame->timestamp_sec);
+        int state = slam_->GetTrackingState();
+
+        // Only publish pose when tracking is valid (state 2=OK, 5=RECENTLY_LOST with pose)
+        if (state == 2 || state == 5) {
+            publishPose(se3, frame->stamp, state);
+        }
+
+        // Throttle map cloud (GetAllMapPoints acquires internal ORB-SLAM3 mutex)
+        bool pub_cloud_now = false;
+        if (!last_cloud_pub_init_) {
+            pub_cloud_now = true;
+            last_cloud_pub_init_ = true;
+            last_cloud_pub_ = frame->stamp;
+        } else if ((frame->stamp - last_cloud_pub_).seconds() >= (1.0 / cfg_.cloud_pub_hz)) {
+            pub_cloud_now = true;
+            last_cloud_pub_ = frame->stamp;
+        }
+        if (pub_cloud_now) publishCloud(frame->stamp);
     }
 }
 

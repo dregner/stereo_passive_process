@@ -12,6 +12,10 @@ passive_stereo_node:
     balance_white_auto: true
     binning:            1          # 1 = full native resolution
 
+    # ---- Camera disconnect recovery --------------------------------------
+    # Consecutive grab errors before triggering rclcpp::shutdown()
+    max_consec_errors:  10
+
     # ---- Trigger mode ----------------------------------------------------
     # true  -> hardware trigger via Jetson GPIO PWM (camera Line3)
     # false -> free-running continuous acquisition
@@ -19,18 +23,18 @@ passive_stereo_node:
     trigger_delay_us: 29
 
     # ---- Jetson GPIO for PWM trigger generation -------------------------
-    # Jetson Orin: GPIO chip=gpiochip0
-    # Pin 16 (GPIO23) is commonly available on the 40-pin header
-    # Run 'gpioinfo' to find the correct line offset for your board.
+    # Jetson Orin Nano: line 85 = PN.01 (GPIO27) = trigger output
+    # Run 'gpioinfo gpiochip0' to confirm pin assignments.
     gpio_chip: "gpiochip0"
-    gpio_line: 106       # Adjust for your Jetson model/pin
+    gpio_line: 85       # PN.01 = trigger line on Jetson Orin (NOT 106 which is laser)
 
     # ---- Stereo calibration ---------------------------------------------
     # OpenCV FileStorage YAML with K1, D1, K2, D2, R, T matrices.
     # See config/stereo_calibration_template.yaml for the format.
     calibration_file: "/home/daniel/ros2_ws/src/passive_stereo_capture/config/stereo_calibration_bfs.yaml"
 
-    # ---- CLAHE (applied in Lab L-channel) --------------------------------
+    # ---- CLAHE (full-res Lab L-channel, for Retinify + Preview) ---------
+    # SLAM receives raw rectified and applies its own grayscale CLAHE post-resize.
     clahe_clip_limit: 2.0
     clahe_tile_size:  8
 
@@ -39,10 +43,10 @@ passive_stereo_node:
     slam_voc_file: "/home/daniel/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/vocabulary/ORBvoc.txt"
     slam_settings_file: "/home/daniel/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/config/stereo_bluerov.yaml"
     slam_use_pangolin: false   # set true to open Pangolin viewer (needs X11)
-    slam_max_width:  800       # SLAM input image max width (maintains aspect ratio)
-    slam_max_height: 600       # SLAM input image max height
+    slam_scale_factor: 0.33     # 2448×2048 * 0.33 ≈ 808×676 — set 1.0 for full resolution
     slam_enu_publish: true
     slam_tf_publish:  false
+    slam_cloud_hz:    2.0      # max rate to publish sparse map cloud (GetAllMapPoints is expensive)
 
     # ---- Coordinate frames -----------------------------------------------
     namespace:        "Passive"
@@ -50,20 +54,20 @@ passive_stereo_node:
     parent_frame_id:  "base_link"
     child_frame_id:   "Passive/left_camera_link"
 
-    # ---- Dense disparity / pointcloud (Retinify GPU) ---------------------
-    disparity_enabled:  true
-    depth_mode:         "accurate"   # "fast" | "balanced" | "accurate"
-    max_dist:           15.0         # metres; 0 = no limit
-    sampling_factor:    1.0          # 1.0 = all pixels; 0.5 = every other pixel
-    crop_factor:        1.0          # 1.0 = full frame; 0.8 = central 80%
+    # ---- Disparity (Retinify GPU) ----------------------------------------
+    disparity_enabled: true
+    depth_mode:       "accurate"   # "fast" | "balanced" | "accurate"
+    max_dist:         15.0         # metres; 0 = no limit
+    sampling_factor:  1.0          # point cloud decimation (0-1]: 0.5 = every other pixel
+    crop_factor:      1.0          # central crop fraction (0-1]
+    min_confidence:   0.35
+    confidence_radius: 2
+    confidence_alpha: 2.0
     publish_confidence: true
-    min_confidence:     0.35
-    confidence_radius:  2
-    confidence_alpha:   2.0
-    disp_frame_id:      "Passive/left_camera_link"
+    disp_frame_id:    "Passive/left_camera_link"
 
-    # ---- Preview (compressed JPEG streaming) ----------------------------
-    preview_enabled:  true
-    preview_width:    612
-    preview_height:   512
-    preview_quality:  50
+    # ---- Preview streaming -----------------------------------------------
+    preview_enabled: true
+    preview_width:   612
+    preview_height:  512
+    preview_quality: 50    # JPEG quality 0-100
