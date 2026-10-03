@@ -7,7 +7,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
-
+#include "clahe_processor.hpp"
 #include "stereo_frame.hpp"
 #include "bounded_queue.hpp"
 
@@ -21,15 +21,21 @@ namespace passive_stereo_capture
 class PreviewWorker
 {
 public:
+    struct Config {
+        int    preview_width{640};
+        int    preview_height{480};
+        int    jpeg_quality{80};
+        double max_fps{10.0};
+        double clahe_clip{2.0};    ///< Grayscale CLAHE clip limit (applied after resize)
+        int    clahe_tiles{8};     ///< Grayscale CLAHE tile grid size
+        bool   clahe_enabled{false}; ///< Apply CLAHE to preview images (Bayer→BGR8)
+    };
     using Publisher = rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr;
 
     PreviewWorker(
         Publisher pub_left,
         Publisher pub_right,
-        int preview_width,
-        int preview_height,
-        int jpeg_quality,
-        double max_fps = 10.0);
+        const Config & cfg);
 
     ~PreviewWorker();
 
@@ -50,11 +56,9 @@ private:
 
     Publisher pub_left_;
     Publisher pub_right_;
-    int preview_width_;
-    int preview_height_;
-    int jpeg_quality_;
-    double max_fps_{10.0};
+    Config cfg_;
 
+    cv::Ptr<cv::CLAHE> clahe_{cv::createCLAHE(cfg_.clahe_clip, cv::Size(cfg_.clahe_tiles, cfg_.clahe_tiles))};
     rclcpp::Time last_pub_time_{0, 0, RCL_ROS_TIME};
     bool last_pub_time_init_{false};
 

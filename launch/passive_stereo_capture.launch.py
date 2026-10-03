@@ -9,10 +9,10 @@ import os
 def generate_launch_description():
     pkg = FindPackageShare('passive_stereo_capture')
 
-    default_params = PathJoinSubstitution([pkg, 'config', 'passive_stereo.yaml'])
+    default_params = PathJoinSubstitution([pkg, 'config', 'bfs_04S4C.yaml'])
     default_calib  = PathJoinSubstitution(
         [pkg, 'config', 'stereo_calibration_bfs.yaml'])
-
+    default_params = '/home/jetson/ros2_ws/src/stereo_passive_process/config/bfs_04S4C.yaml'
     return LaunchDescription([
         DeclareLaunchArgument(
             'params_file',

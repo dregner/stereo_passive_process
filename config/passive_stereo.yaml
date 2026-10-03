@@ -37,13 +37,13 @@ passive_stereo_node:
     # SLAM receives raw rectified and applies its own grayscale CLAHE post-resize.
     clahe_clip_limit: 2.0
     clahe_tile_size:  8
-
+    enable_clahe: false
     # ---- SLAM (ORB-SLAM3) ------------------------------------------------
     slam_enabled: true
     slam_voc_file: "/home/daniel/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/vocabulary/ORBvoc.txt"
     slam_settings_file: "/home/daniel/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/config/stereo_bluerov.yaml"
     slam_use_pangolin: false   # set true to open Pangolin viewer (needs X11)
-    slam_scale_factor: 0.33     # 2448×2048 * 0.33 ≈ 808×676 — set 1.0 for full resolution
+    slam_scale_factor: 0.25     # 2448×2048 * 0.25 ≈ 612×512 — set 1.0 for full resolution
     slam_enu_publish: true
     slam_tf_publish:  false
     slam_cloud_hz:    2.0      # max rate to publish sparse map cloud (GetAllMapPoints is expensive)

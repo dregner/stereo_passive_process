@@ -13,13 +13,11 @@ namespace passive_stereo_capture
 
 DisparityWorker::DisparityWorker(
     PointCloud2Pub pub_cloud,
-    const StereoRectifier & rect,
+    const StereoCalib & calib,
     const Config & cfg)
 : pub_cloud_(std::move(pub_cloud)),
   cfg_(cfg),
-  fx_(rect.fx()), fy_(rect.fy()),
-  cx_(rect.cx()), cy_(rect.cy()),
-  baseline_m_(rect.baseline())
+  calib_(calib)
 {}
 
 DisparityWorker::~DisparityWorker()
@@ -55,13 +53,18 @@ bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
     calib.imageWidth  = W;
     calib.imageHeight = H;
     // Rectified intrinsics
-    calib.leftIntrinsics.fx  = fx_;
-    calib.leftIntrinsics.fy  = fy_;
-    calib.leftIntrinsics.cx  = cx_;
-    calib.leftIntrinsics.cy  = cy_;
-    calib.rightIntrinsics    = calib.leftIntrinsics;
-    calib.rotation           = retinify::Identity();
-    calib.translation        = {-std::abs(baseline_m_), 0.0, 0.0};
+    calib.leftIntrinsics.fx  = calib_.fx_l();
+    calib.leftIntrinsics.fy  = calib_.fy_l();
+    calib.leftIntrinsics.cx  = calib_.cx_l();
+    calib.leftIntrinsics.cy  = calib_.cy_l();
+    calib.rightIntrinsics.fx = calib_.fx_r();
+    calib.rightIntrinsics.fy = calib_.fy_r();
+    calib.rightIntrinsics.cx = calib_.cx_r();
+    calib.rightIntrinsics.cy = calib_.cy_r();
+    calib.leftDistortion    = calib_.toRetinifyDistortion(calib_.leftDistortions());
+    calib.rightDistortion   = calib_.toRetinifyDistortion(calib_.rightDistortions());
+    calib.rotation           = calib_.rot();
+    calib.translation        = calib_.trans();
 
     auto status = pipeline_.Initialize(W, H, retinify::PixelFormat::RGB8, mode, calib);
     if (!status.IsOK()) return false;
@@ -112,7 +115,7 @@ size_t DisparityWorker::compactCloud(
     int conf_radius, float conf_alpha, float min_conf)
 {
     // FIX #7: parallelize row loop with OpenMP
-    const size_t pt_size = with_conf ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
+    const size_t pt_size = sizeof(PointXYZRGB);
     int rows = (v1 - v0 + step - 1) / step;
 
     // Per-thread local buffers collected after the parallel loop
@@ -171,15 +174,9 @@ size_t DisparityWorker::compactCloud(
             uint8_t r = img_row[u*3+0], g = img_row[u*3+1], b = img_row[u*3+2];
             uint32_t rgb = (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
 
-            if (with_conf) {
-                PointXYZRGBConf pt{X, Y, Z, rgb, conf};
-                const uint8_t * src = reinterpret_cast<const uint8_t *>(&pt);
-                lbuf.insert(lbuf.end(), src, src + sizeof(pt));
-            } else {
-                PointXYZRGB pt{X, Y, Z, rgb};
-                const uint8_t * src = reinterpret_cast<const uint8_t *>(&pt);
-                lbuf.insert(lbuf.end(), src, src + sizeof(pt));
-            }
+            PointXYZRGB pt{X, Y, Z, rgb};
+            const uint8_t * src = reinterpret_cast<const uint8_t *>(&pt);
+            lbuf.insert(lbuf.end(), src, src + sizeof(pt));
         }
     }
 
@@ -210,10 +207,18 @@ void DisparityWorker::run()
                 continue;
             }
         }
+        cv::Mat left_rgb, right_rgb;
+        if (cfg_.clahe_enabled) {
+                left_rgb=applyClaheRGB(frame->left_rgb, clahe_);
+                right_rgb=applyClaheRGB(frame->right_rgb, clahe_);
+        } else {
+            left_rgb  = frame->left_rgb;
+            right_rgb = frame->right_rgb;
+        }
 
         auto status = pipeline_.Execute(
-            frame->left_rgb.ptr<uint8_t>(),  frame->left_rgb.step[0],
-            frame->right_rgb.ptr<uint8_t>(), frame->right_rgb.step[0]);
+            left_rgb.ptr<uint8_t>(),  left_rgb.step[0],
+            right_rgb.ptr<uint8_t>(), right_rgb.step[0]);
         if (!status.IsOK()) continue;
 
         // Retrieve disparity for confidence gating
@@ -254,7 +259,7 @@ void DisparityWorker::run()
         if (valid == 0) continue;
 
         // FIX #9: Build PointCloud2 using pre-allocated buffer — no heap alloc on hot path
-        uint32_t pt_step = wconf ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
+        uint32_t pt_step = sizeof(PointXYZRGB);
         size_t   data_sz = valid * pt_step;
 
         auto cloud = std::make_unique<sensor_msgs::msg::PointCloud2>();
@@ -266,20 +271,12 @@ void DisparityWorker::run()
         cloud->is_bigendian    = false;
 
         sensor_msgs::PointCloud2Modifier mod(*cloud);
-        if (wconf) {
-            mod.setPointCloud2Fields(5,
-                "x", 1, sensor_msgs::msg::PointField::FLOAT32,
-                "y", 1, sensor_msgs::msg::PointField::FLOAT32,
-                "z", 1, sensor_msgs::msg::PointField::FLOAT32,
-                "rgb", 1, sensor_msgs::msg::PointField::UINT32,
-                "confidence", 1, sensor_msgs::msg::PointField::FLOAT32);
-        } else {
-            mod.setPointCloud2Fields(4,
-                "x", 1, sensor_msgs::msg::PointField::FLOAT32,
-                "y", 1, sensor_msgs::msg::PointField::FLOAT32,
-                "z", 1, sensor_msgs::msg::PointField::FLOAT32,
-                "rgb", 1, sensor_msgs::msg::PointField::UINT32);
-        }
+
+        mod.setPointCloud2Fields(4,
+            "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "rgb", 1, sensor_msgs::msg::PointField::UINT32);
         cloud->point_step = pt_step;
         cloud->row_step   = cloud->width * pt_step;
 

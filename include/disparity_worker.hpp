@@ -12,10 +12,10 @@
 
 #include <cuda_runtime.h>
 #include <retinify/retinify.hpp>
-
+#include "clahe_processor.hpp"
 #include "stereo_frame.hpp"
 #include "bounded_queue.hpp"
-#include "stereo_rectifier.hpp"
+#include "stereo_calib.hpp"
 
 namespace passive_stereo_capture
 {
@@ -36,13 +36,16 @@ public:
         double confidence_alpha{2.0};
         bool   publish_confidence{true};
         std::string frame_id{"Passive/left_camera_link"};
+        double clahe_clip{2.0};    ///< Grayscale CLAHE clip limit (applied after resize)
+        int    clahe_tiles{8};     ///< Grayscale CLAHE tile grid size
+        bool  clahe_enabled{false}; ///< Apply CLAHE to preview images (Bayer→BGR8)
     };
 
     using PointCloud2Pub = rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr;
 
     DisparityWorker(
         PointCloud2Pub pub_cloud,
-        const StereoRectifier & rectifier,   ///< Used for calibration params (P1/P2/baseline)
+        const StereoCalib & rectifier,   ///< Used for calibration params (P1/P2/baseline)
         const Config & cfg);
 
     ~DisparityWorker();
@@ -71,7 +74,8 @@ private:
 
     PointCloud2Pub pub_cloud_;
     Config         cfg_;
-    double fx_, fy_, cx_, cy_, baseline_m_;
+    StereoCalib    calib_;
+    cv::Ptr<cv::CLAHE> clahe_{cv::createCLAHE(cfg_.clahe_clip, cv::Size(cfg_.clahe_tiles, cfg_.clahe_tiles))};
 
     retinify::Pipeline pipeline_;
     bool               pipeline_init_{false};

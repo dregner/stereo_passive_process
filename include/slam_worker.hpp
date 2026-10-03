@@ -53,6 +53,7 @@ public:
         double cloud_pub_hz{2.0};  ///< Max rate to call GetAllMapPoints (acquires mutex)
         double clahe_clip{2.0};    ///< Grayscale CLAHE clip limit (applied after resize)
         int    clahe_tiles{8};     ///< Grayscale CLAHE tile grid size
+        bool  clahe_enabled{false}; ///< Apply CLAHE to preview images (Bayer→BGR8)
     };
 
     using PosePub   = rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr;
@@ -116,7 +117,8 @@ private:
     std::atomic<bool> reset_requested_{false};
 
     // Grayscale CLAHE applied post-resize (efficient — small image only)
-    cv::Ptr<cv::CLAHE> clahe_gray_;
+    // cv::Ptr<cv::CLAHE> clahe_gray_;
+    cv::Ptr<cv::CLAHE> clahe_gray_{cv::createCLAHE(cfg_.clahe_clip, cv::Size(cfg_.clahe_tiles, cfg_.clahe_tiles))};
 
     BoundedQueue<StereoFramePtr> queue_{2, /*drop_oldest=*/false};
     std::thread       thread_;

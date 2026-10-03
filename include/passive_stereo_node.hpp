@@ -13,7 +13,7 @@
 #include <std_srvs/srv/trigger.hpp>
 
 #include "spinnaker_grabber.hpp"
-#include "stereo_rectifier.hpp"
+#include "stereo_calib.hpp"
 #include "slam_worker.hpp"
 #include "disparity_worker.hpp"
 #include "preview_worker.hpp"
@@ -56,7 +56,7 @@ private:
 
     // ── Workers ────────────────────────────────────────────────────────────────
     std::unique_ptr<SpinnakerGrabber>  grabber_;
-    std::unique_ptr<StereoRectifier>   rectifier_;
+    std::unique_ptr<StereoCalib>   calib_;
     std::unique_ptr<SlamWorker>        slam_worker_;
     std::unique_ptr<DisparityWorker>   disp_worker_;
     std::unique_ptr<PreviewWorker>     prev_worker_;

@@ -110,7 +110,7 @@ endif()
 
 # ---- Sources --------------------------------------------------------------
 set(SOURCES
-  src/stereo_rectifier.cpp
+  src/stereo_calib.cpp
   src/gpio_trigger.cpp
   src/spinnaker_grabber.cpp
   src/slam_worker.cpp

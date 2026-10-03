@@ -225,11 +225,11 @@ void SlamWorker::run()
         // Apply scale_factor directly via cv::resize fractional scaling.
         cv::Mat left_small, right_small;
         if (cfg_.scale_factor != 1.0 && cfg_.scale_factor > 0.0) {
-            cv::resize(frame->left_gray,  left_small,  cv::Size(), cfg_.scale_factor, cfg_.scale_factor, cv::INTER_LINEAR);
-            cv::resize(frame->right_gray, right_small, cv::Size(), cfg_.scale_factor, cfg_.scale_factor, cv::INTER_LINEAR);
+            cv::resize(frame->left_raw,  left_small,  cv::Size(), cfg_.scale_factor, cfg_.scale_factor, cv::INTER_LINEAR);
+            cv::resize(frame->right_raw, right_small, cv::Size(), cfg_.scale_factor, cfg_.scale_factor, cv::INTER_LINEAR);
         } else {
-            left_small  = frame->left_gray;
-            right_small = frame->right_gray;
+            left_small  = frame->left_raw;
+            right_small = frame->right_raw;
         }
 
         // Apply CLAHE on the small grayscale image — efficient (small resolution)

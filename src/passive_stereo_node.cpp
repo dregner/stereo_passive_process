@@ -57,6 +57,7 @@ void PassiveStereoNode::declareParameters()
     // CLAHE (applied on RGB for Retinify/Preview; gray CLAHE params reused for SLAM)
     declare_parameter("clahe_clip_limit",  2.0);
     declare_parameter("clahe_tile_size",   8);
+    declare_parameter("enable_clahe",       false);
 
     // SLAM
     declare_parameter("slam_enabled",       true);
@@ -104,21 +105,16 @@ void PassiveStereoNode::init()
     rclcpp::QoS best_effort_qos(2);
     best_effort_qos.reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
 
-    // ── CLAHE (full-res RGB for Retinify/Preview path) ─────────────────────────
-    double clip  = get_parameter("clahe_clip_limit").as_double();
-    int    tiles = get_parameter("clahe_tile_size").as_int();
-    clahe_ = cv::createCLAHE(clip, cv::Size(tiles, tiles));
-
     // ── Stereo Rectifier ───────────────────────────────────────────────────────
     std::string calib_file = get_parameter("calibration_file").as_string();
     if (calib_file.empty()) {
         throw std::runtime_error(
             "passive_stereo_node: 'calibration_file' parameter must be set!");
     }
-    rectifier_ = std::make_unique<StereoRectifier>();
-    rectifier_->load(calib_file);
+    calib_ = std::make_unique<StereoCalib>();
+    calib_->load(calib_file);
     RCLCPP_INFO(get_logger(), "Calibration loaded: %dx%d, baseline=%.4f m",
-        rectifier_->width(), rectifier_->height(), rectifier_->baseline());
+        calib_->width(), calib_->height(), calib_->baseline());
 
     // ── Feature flags ──────────────────────────────────────────────────────────
     slam_enabled_    = get_parameter("slam_enabled").as_bool();
@@ -146,8 +142,8 @@ void PassiveStereoNode::init()
         slam_cfg.enu_publish    = get_parameter("slam_enu_publish").as_bool();
         slam_cfg.tf_publish     = get_parameter("slam_tf_publish").as_bool();
         slam_cfg.cloud_pub_hz   = get_parameter("slam_cloud_hz").as_double();
-        slam_cfg.clahe_clip     = clip;
-        slam_cfg.clahe_tiles    = tiles;
+        slam_cfg.clahe_clip     = get_parameter("clahe_clip_limit").as_double();
+        slam_cfg.clahe_tiles    = get_parameter("clahe_grid_size").as_int();
 
         slam_worker_ = std::make_unique<SlamWorker>(
             this, pub_pose, pub_cloud, pub_path, slam_cfg);
@@ -175,8 +171,11 @@ void PassiveStereoNode::init()
         disp_cfg.confidence_alpha    = get_parameter("confidence_alpha").as_double();
         disp_cfg.publish_confidence  = get_parameter("publish_confidence").as_bool();
         disp_cfg.frame_id            = get_parameter("disp_frame_id").as_string();
+        disp_cfg.clahe_clip           = get_parameter("clahe_clip_limit").as_double();
+        disp_cfg.clahe_tiles          = get_parameter("clahe_tile_size").as_int();
+        disp_cfg.clahe_enabled        = get_parameter("enable_clahe").as_bool();
 
-        disp_worker_ = std::make_unique<DisparityWorker>(pub_cloud, *rectifier_, disp_cfg);
+        disp_worker_ = std::make_unique<DisparityWorker>(pub_cloud, *calib_, disp_cfg);
         disp_worker_->start();
         RCLCPP_INFO(get_logger(), "Disparity worker started");
     }
@@ -188,15 +187,20 @@ void PassiveStereoNode::init()
         auto pub_right = create_publisher<sensor_msgs::msg::CompressedImage>(
             mk("right/preview/image/compressed"), best_effort_qos);
 
-        int    pw  = get_parameter("preview_width").as_int();
-        int    ph  = get_parameter("preview_height").as_int();
-        int    pq  = get_parameter("preview_quality").as_int();
-        double pfps = get_parameter("preview_fps").as_double();
+        PreviewWorker::Config prev_cfg;
 
-        prev_worker_ = std::make_unique<PreviewWorker>(pub_left, pub_right, pw, ph, pq, pfps);
+        prev_cfg.preview_width  = get_parameter("preview_width").as_int();
+        prev_cfg.preview_height = get_parameter("preview_height").as_int();
+        prev_cfg.jpeg_quality   = get_parameter("preview_quality").as_int();
+        prev_cfg.max_fps        = get_parameter("preview_fps").as_double();
+        prev_cfg.clahe_clip     = get_parameter("clahe_clip_limit").as_double();
+        prev_cfg.clahe_tiles    = get_parameter("clahe_grid_size").as_int();
+        prev_cfg.clahe_enabled  = get_parameter("enable_clahe").as_bool();
+
+        prev_worker_ = std::make_unique<PreviewWorker>(pub_left, pub_right, prev_cfg);
         prev_worker_->start();
         RCLCPP_INFO(get_logger(), "Preview worker started (%dx%d, q=%d, max_fps=%.1f)",
-            pw, ph, pq, pfps);
+            prev_cfg.preview_width, prev_cfg.preview_height, prev_cfg.jpeg_quality, prev_cfg.max_fps);
     }
 
     // ── GPIO Trigger ───────────────────────────────────────────────────────────
@@ -260,44 +264,16 @@ void PassiveStereoNode::preprocessThread()
         const RawFrame & left_raw  = pair.first;
         const RawFrame & right_raw = pair.second;
 
-        // ── SLAM path: BayerRG8 → GRAY (fast, single-step) → rectify ──────────
-        // cv::COLOR_BayerRG2GRAY computes a weighted average of the raw Bayer cells,
-        // giving a good luminance estimate without a full 3-channel debayer.
-        cv::Mat left_gray_raw, right_gray_raw;
-        cv::cvtColor(left_raw.image,  left_gray_raw,  cv::COLOR_BayerRG2GRAY);
-        cv::cvtColor(right_raw.image, right_gray_raw, cv::COLOR_BayerRG2GRAY);
-
-        cv::Mat left_gray, right_gray;
-        rectifier_->rectify(left_gray_raw, right_gray_raw, left_gray, right_gray);
-
-        // ── Disparity path: BayerRG8 → RGB → rectify → CLAHE ─────────────────
         cv::Mat left_rgb_raw, right_rgb_raw;
         cv::cvtColor(left_raw.image,  left_rgb_raw,  cv::COLOR_BayerRG2RGB);
         cv::cvtColor(right_raw.image, right_rgb_raw, cv::COLOR_BayerRG2RGB);
 
-        cv::Mat left_rgb_rect, right_rgb_rect;
-        rectifier_->rectify(left_rgb_raw, right_rgb_raw, left_rgb_rect, right_rgb_rect);
-
-        // Apply CLAHE in CIE Lab L-channel to the rectified RGB image
-        cv::Mat left_rgb  = applyClaheRGB(left_rgb_rect,  clahe_);
-        cv::Mat right_rgb = applyClaheRGB(right_rgb_rect, clahe_);
-
-        // ── Preview path: BayerRG8 → BGR8 (unrectified, native ROS 2 color space) ──
-        cv::Mat left_raw_bgr, right_raw_bgr;
-        if (prev_enabled_) {
-            cv::cvtColor(left_raw.image,  left_raw_bgr,  cv::COLOR_BayerRG2BGR);
-            cv::cvtColor(right_raw.image, right_raw_bgr, cv::COLOR_BayerRG2BGR);
-        }
-
         // ── Build StereoFrame ─────────────────────────────────────────────────
         auto frame = std::make_shared<StereoFrame>();
-        frame->left_gray     = std::move(left_gray);
-        frame->right_gray    = std::move(right_gray);
-        frame->left_rgb      = std::move(left_rgb);
-        frame->right_rgb     = std::move(right_rgb);
-        frame->left_raw_bgr  = std::move(left_raw_bgr);  // Unrectified BGR8 for ROS 2 preview
-        frame->right_raw_bgr = std::move(right_raw_bgr); // Unrectified BGR8 for ROS 2 preview
-
+        frame->left_raw          = left_raw.image;
+        frame->right_raw         = right_raw.image;
+        frame->left_rgb          = std::move(left_rgb_raw);
+        frame->right_rgb         = std::move(right_rgb_raw);
         // Integer timestamp — no floating-point round-trip
         frame->timestamp_ns  = left_raw.timestamp_ns;
         frame->timestamp_sec = static_cast<double>(left_raw.timestamp_ns) * 1e-9;
