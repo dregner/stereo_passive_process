@@ -1,12 +1,12 @@
 passive_stereo_node:
   ros__parameters:
     # ---- Camera serials (match your BFS cameras) --------------------------
-    cam_left_serial:  "22548033"
-    cam_right_serial: "22548025"
+    cam_left_serial:  "23267854"
+    cam_right_serial: "23267852"
 
     # ---- Acquisition settings -------------------------------------------
     frame_rate:         30.0
-    exposure_time:      33333.84   # microseconds (1/30 s)
+    exposure_time:      16667.0   # microseconds (1/30 s)
     gain:               0.0        # dB (used only when gain_auto=false)
     gain_auto:          false
     balance_white_auto: true
@@ -19,7 +19,7 @@ passive_stereo_node:
     # ---- Trigger mode ----------------------------------------------------
     # true  -> hardware trigger via Jetson GPIO PWM (camera Line3)
     # false -> free-running continuous acquisition
-    trigger_mode:     true
+    trigger_mode:     false
     trigger_delay_us: 29
 
     # ---- Jetson GPIO for PWM trigger generation -------------------------
@@ -56,6 +56,10 @@ passive_stereo_node:
 
     # ---- Disparity (Retinify GPU) ----------------------------------------
     disparity_enabled: true
+    depth_width:        0         # 0/0: native; e.g. 1600/1200 or 2448/2048 for load tests
+    depth_height:       0
+    disp_cloud_hz:      15.0
+    disp_image_hz:      10.0
     depth_mode:       "accurate"   # "fast" | "balanced" | "accurate"
     max_dist:         15.0         # metres; 0 = no limit
     sampling_factor:  1.0          # point cloud decimation (0-1]: 0.5 = every other pixel
@@ -68,7 +72,7 @@ passive_stereo_node:
 
     # ---- Preview streaming (unrectified raw perspective) ----------------
     preview_enabled: true
-    preview_width:   612
-    preview_height:  512
+    preview_width:   720
+    preview_height:  540
     preview_quality: 50    # JPEG quality 0-100
-    preview_fps:     10.0  # Max publishing rate for preview (e.g. 10.0 Hz)
+    preview_fps:     15.0  # Max publishing rate for preview (e.g. 10.0 Hz)

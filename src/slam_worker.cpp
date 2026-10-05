@@ -11,9 +11,9 @@ namespace passive_stereo_capture
 
 // ORB-SLAM3: Z=forward, X=right, Y=down  -->  ROS ENU: X=forward, Y=left, Z=up
 const tf2::Matrix3x3 SlamWorker::kOrbToRosEnu(
-     0.0,  0.0,  1.0,
+    0.0,  0.0,  1.0,
     -1.0,  0.0,  0.0,
-     0.0, -1.0,  0.0);
+    0.0, -1.0,  0.0);
 
 SlamWorker::SlamWorker(
     rclcpp::Node * node,
@@ -37,9 +37,7 @@ SlamWorker::SlamWorker(
         ORB_SLAM3::System::STEREO,
         cfg_.use_pangolin));
 
-    // Grayscale CLAHE applied after resize (small image — efficient)
-    clahe_gray_ = cv::createCLAHE(cfg_.clahe_clip,
-                                   cv::Size(cfg_.clahe_tiles, cfg_.clahe_tiles));
+    path_msg_.header.frame_id = cfg_.frame_id;
 
     RCLCPP_INFO(node_->get_logger(), "SlamWorker: ORB-SLAM3 initialised");
 }
@@ -47,7 +45,6 @@ SlamWorker::SlamWorker(
 SlamWorker::~SlamWorker()
 {
     stop();
-    // unique_ptr destructor calls SlamDeleter → Shutdown() + delete
 }
 
 void SlamWorker::push(StereoFramePtr frame) { queue_.push(std::move(frame)); }
@@ -68,7 +65,6 @@ void SlamWorker::stop()
 
 void SlamWorker::reset()
 {
-    // Safe: just set atomic flag; run() applies it at the top of its loop
     reset_requested_.store(true);
 }
 
@@ -123,7 +119,6 @@ void SlamWorker::publishPose(
         }
         T_zeroed = initial_offset_.inverse() * T_map_base;
     } else {
-        // TF not yet available — publish raw ENU pose in map frame
         if (!initial_offset_set_) {
             initial_offset_.setIdentity();
             initial_offset_.setOrigin(T_map_cam.getOrigin());
@@ -146,7 +141,6 @@ void SlamWorker::publishPose(
     msg->header.frame_id = cfg_.frame_id;
     tf2::toMsg(T_zeroed, msg->pose.pose);
 
- 
     std::fill(msg->pose.covariance.begin(), msg->pose.covariance.end(), 0.0);
     if (state == 2 || state == 5) {
         msg->pose.covariance[0]  = 0.05;
@@ -161,11 +155,28 @@ void SlamWorker::publishPose(
         msg->pose.covariance.fill(-1.0);
     }
 
-    pub_pose_->publish(std::move(msg));
+    if (pub_pose_) {
+        pub_pose_->publish(*msg);
+    }
+
+    // Accumulate path and publish if subscribed
+    if (pub_path_ && pub_path_->get_subscription_count() > 0) {
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header = msg->header;
+        ps.pose = msg->pose.pose;
+        path_msg_.header.stamp = stamp;
+        path_msg_.poses.push_back(ps);
+        if (path_msg_.poses.size() > 5000) {
+            path_msg_.poses.erase(path_msg_.poses.begin(), path_msg_.poses.begin() + 1000);
+        }
+        pub_path_->publish(path_msg_);
+    }
 }
 
 void SlamWorker::publishCloud(const rclcpp::Time & stamp)
 {
+    if (!pub_cloud_ || pub_cloud_->get_subscription_count() == 0) return;
+
     auto pts = slam_->GetAllMapPoints();
     std::vector<std::array<float,3>> valid_pts;
     valid_pts.reserve(pts.size());
@@ -209,53 +220,65 @@ void SlamWorker::run()
     while (running_.load()) {
         StereoFramePtr frame;
         if (!queue_.pop(frame)) continue;
+        const auto processing_start = std::chrono::steady_clock::now();
 
-        // Handle reset safely inside the worker thread (atomic flag set by reset())
         if (reset_requested_.exchange(false)) {
             slam_->Reset();
             slam_->ResetActiveMap();
             initial_offset_set_ = false;
+            path_msg_.poses.clear();
             RCLCPP_INFO(node_->get_logger(), "SlamWorker: SLAM reset applied");
         }
 
         tryLookupTf();
 
-        // SLAM path: receives rectified grayscale (CV_8UC1).
-        // BayerRG2GRAY already done in preprocessThread — no color conversion needed here.
-        // Apply scale_factor directly via cv::resize fractional scaling.
-        cv::Mat left_small, right_small;
-        if (cfg_.scale_factor != 1.0 && cfg_.scale_factor > 0.0) {
-            cv::resize(frame->left_raw,  left_small,  cv::Size(), cfg_.scale_factor, cfg_.scale_factor, cv::INTER_LINEAR);
-            cv::resize(frame->right_raw, right_small, cv::Size(), cfg_.scale_factor, cfg_.scale_factor, cv::INTER_LINEAR);
-        } else {
-            left_small  = frame->left_raw;
-            right_small = frame->right_raw;
+        cv::Mat left_gray, right_gray;
+        cv::cvtColor(frame->left_raw,  left_gray,  cv::COLOR_BayerRG2GRAY);
+        cv::cvtColor(frame->right_raw, right_gray, cv::COLOR_BayerRG2GRAY);
+
+        // User guidance: "below 800x600 you use full size"
+        double effective_scale = cfg_.scale_factor;
+        if (left_gray.cols <= 800 && left_gray.rows <= 600) {
+            effective_scale = 1.0;
         }
 
-        // Apply CLAHE on the small grayscale image — efficient (small resolution)
-        clahe_gray_->apply(left_small,  left_small);
-        clahe_gray_->apply(right_small, right_small);
+        cv::Mat left_small, right_small;
+        if (effective_scale != 1.0 && effective_scale > 0.0) {
+            cv::resize(left_gray,  left_small,  cv::Size(), effective_scale, effective_scale, cv::INTER_LINEAR);
+            cv::resize(right_gray, right_small, cv::Size(), effective_scale, effective_scale, cv::INTER_LINEAR);
+        } else {
+            left_small  = left_gray;
+            right_small = right_gray;
+        }
 
-        // Track
+        if (cfg_.clahe_enabled) {
+            clahe_gray_->apply(left_small,  left_small);
+            clahe_gray_->apply(right_small, right_small);
+        }
+
         auto se3  = slam_->TrackStereo(left_small, right_small, frame->timestamp_sec);
         int state = slam_->GetTrackingState();
+        last_tracking_state_.store(state);
+        processed_frames_++;
 
-        // Only publish pose when tracking is valid (state 2=OK, 5=RECENTLY_LOST with pose)
         if (state == 2 || state == 5) {
             publishPose(se3, frame->stamp, state);
         }
 
-        // Throttle map cloud (GetAllMapPoints acquires internal ORB-SLAM3 mutex)
+        // Throttle map cloud publishing & check subscriptions
         bool pub_cloud_now = false;
-        if (!last_cloud_pub_init_) {
-            pub_cloud_now = true;
-            last_cloud_pub_init_ = true;
-            last_cloud_pub_ = frame->stamp;
-        } else if ((frame->stamp - last_cloud_pub_).seconds() >= (1.0 / cfg_.cloud_pub_hz)) {
-            pub_cloud_now = true;
-            last_cloud_pub_ = frame->stamp;
+        if (pub_cloud_ && pub_cloud_->get_subscription_count() > 0) {
+            if (!last_cloud_pub_init_) {
+                pub_cloud_now = true;
+                last_cloud_pub_init_ = true;
+                last_cloud_pub_ = frame->stamp;
+            } else if ((frame->stamp - last_cloud_pub_).seconds() >= (1.0 / std::max(0.1, cfg_.cloud_pub_hz))) {
+                pub_cloud_now = true;
+                last_cloud_pub_ = frame->stamp;
+            }
         }
         if (pub_cloud_now) publishCloud(frame->stamp);
+        metrics_.record(processing_start, frame->received_at);
     }
 }
 

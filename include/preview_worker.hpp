@@ -10,6 +10,7 @@
 #include "clahe_processor.hpp"
 #include "stereo_frame.hpp"
 #include "bounded_queue.hpp"
+#include "rate_limiter.hpp"
 
 namespace passive_stereo_capture
 {
@@ -59,13 +60,12 @@ private:
     Config cfg_;
 
     cv::Ptr<cv::CLAHE> clahe_{cv::createCLAHE(cfg_.clahe_clip, cv::Size(cfg_.clahe_tiles, cfg_.clahe_tiles))};
-    rclcpp::Time last_pub_time_{0, 0, RCL_ROS_TIME};
-    bool last_pub_time_init_{false};
 
     // FIX #10: persistent encode buffers — cv::imencode reuses allocation
     std::vector<uchar> buf_left_;
     std::vector<uchar> buf_right_;
 
+    RateLimiter limiter_;
     BoundedQueue<StereoFramePtr> queue_{1, /*drop_oldest=*/true};
     std::thread thread_;
     std::atomic<bool> running_{false};

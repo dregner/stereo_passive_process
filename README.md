@@ -9,46 +9,68 @@ Designed to run on a **Jetson Orin Nano Super (JetPack 6.2, aarch64)** with came
 ## Architecture
 
 ```
-Cameras (BayerRG8 raw, Spinnaker SDK)
-         │
-         │  grabThread × 2  ──  syncThread (FrameID match)
-         │  (raw BayerRG8, CV_8UC1 — no conversion in grabber)
-         ▼
-    preprocess queue
-         │
-    preprocessThread
-      ├─ SLAM path ──────────── BayerRG2GRAY → rectify
-      │                         → StereoFrame::left_gray / right_gray
-      │
-      └─ Disparity + Preview ── BayerRG2RGB → rectify → CLAHE (CIE Lab L)
-                                → StereoFrame::left_rgb / right_rgb
-                                  (one debayer, two consumers)
-         │              │                │
-    SlamWorker    DisparityWorker   PreviewWorker
-    ORB-SLAM3     Retinify GPU      JPEG compress
-    (gray,        (RGB+CLAHE)       (reuses left_rgb)
-     resize,
-     CLAHE gray)
-         │              │                │
-    /Passive/      /Passive/        /Passive/left/
-    slam/…         disparity/       preview/image/
-                   pointcloud       compressed
+Spinnaker raw Bayer stereo pair
+  ├─ SLAM queue (latest pending pair) → gray → scale → optional gray CLAHE → ORB-SLAM3
+  └─ Color queue (latest pending pair) → RGB
+       ├─ Depth queue → optional resize → optional Lab L CLAHE → Retinify
+       │              → rate-limited cloud / disparity visualization
+       └─ Preview queue → resize → optional Lab L CLAHE → JPEG
 ```
 
-### Key design decisions
+SLAM is dispatched before RGB conversion. Frames share owned Bayer storage;
+color workers receive separate metadata so they never modify a frame being read
+by SLAM. All pending queues have capacity one and drop their oldest pending item.
+This bounds queued work, but does not guarantee processing every acquired frame.
 
-| Decision | Rationale |
-|---|---|
-| Raw BayerRG8 in grabber | Defer conversion cost; each consumer chooses its format |
-| `BayerRG2GRAY` for SLAM | Single-step, no intermediate RGB; ~3× cheaper than full debayer |
-| `BayerRG2RGB` + CLAHE shared by Retinify and Preview | One debayer operation serves two consumers |
-| CLAHE in CIE Lab L-channel (full-res) | Improves contrast for depth estimation without hue shift |
-| Grayscale CLAHE on resized SLAM image | Applied post-scale on a small image — negligible cost |
-| Hardware GPIO trigger (libgpiod PWM) | Guarantees both cameras fire on the same pulse → zero-skew synchronization |
-| Preprocess thread decouples sync thread | Sync thread returns immediately; debayer/rectify/CLAHE never block frame acquisition |
-| Drop-oldest queues for Disparity / Preview | Always process the newest frame; skip if behind |
-| Drop-newest queue (depth 2) for SLAM | SLAM must not skip frames to maintain tracking continuity |
-| `std::unique_ptr<ORB_SLAM3::System, SlamDeleter>` | Exception-safe; destructor calls `Shutdown()` cleanly |
+ROS headers preserve the left image's host receipt timestamp. This is not an
+exposure timestamp; camera-clock mapping and hardware synchronization remain
+necessary for accurate timing and geometry. Worker diagnostics report the latest
+processing duration, receipt age, and queue drop counters, not percentile statistics.
+
+`enable_clahe` controls Lab L-channel CLAHE for depth/preview and grayscale CLAHE
+for SLAM. Depth CLAHE runs after the optional processing resize.
+
+**Calibration warning:** the supplied calibration values are examples. The selected
+ORB-SLAM3 `Rectified` settings expect already rectified images, while this wrapper
+currently supplies unrectified grayscale. Benchmark rates and latency before
+calibration, but do not interpret the resulting pose scale or cloud as validated
+geometry. Generate matching SLAM and depth settings and enable the appropriate
+rectification when calibrating the final stereo assembly.
+
+### Live load tests
+
+Build separately without changing the existing workspace installation:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cmake -S . -B /tmp/passive_stereo_build -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/passive_stereo_build -j2
+/usr/bin/python3 tools/run_load_test.py --binary /tmp/passive_stereo_build/passive_stereo_node --output /tmp/stereo_native
+/usr/bin/python3 tools/run_load_test.py --binary /tmp/passive_stereo_build/passive_stereo_node --width 1600 --height 1200 --output /tmp/stereo_2mp
+/usr/bin/python3 tools/run_load_test.py --binary /tmp/passive_stereo_build/passive_stereo_node --width 2448 --height 2048 --clahe --output /tmp/stereo_5mp
+```
+
+Add `--large-data` to load `config/fastdds_large_data.xml` in both test processes.
+The profile uses a 128 MiB shared-memory segment and retains UDP for discovery
+and remote participants. Apply it to both publisher and local subscriber in
+production with `FASTRTPS_DEFAULT_PROFILES_FILE`; it is not enabled automatically
+by the launch file. Remote cloud delivery still requires a separate bandwidth test.
+
+Each test enables best-effort subscribers for pose, cloud, disparity JPEG, and both
+previews, saves pipeline logs, and reports delivered rates plus receipt-stamp age
+p50/p95. Exit via SIGINT releases camera acquisition. Software enlargement only
+stresses depth processing/output; it does not simulate larger-sensor acquisition,
+USB traffic, native full-resolution demosaicing, or additional image detail.
+
+`depth_width` / `depth_height` must both be zero (native) or both positive.
+`disp_cloud_hz` defaults to 15 Hz; actual delivery depends on worker throughput.
+Pose is published for every valid tracking result (states OK / OK_KLT), with no
+pose rate limiter. Lost/uninitialized tracking does not publish a fabricated pose.
+
+The cloud confidence field is a local disparity smoothness heuristic, not model
+uncertainty. Cloud packing reuses a flat buffer and emits the confidence field
+when confidence filtering is available. Clouds are skipped if rectified color
+retrieval fails, because raw color would not align with rectified XYZ.
 
 ---
 
@@ -111,7 +133,7 @@ source install/setup.bash
 
 ## Camera calibration
 
-The node requires an OpenCV `FileStorage` YAML calibration file. Use the template as a starting point:
+The node currently requires an OpenCV `FileStorage` YAML calibration file even for timing tests. Use the template as a starting point:
 
 ```
 config/stereo_calibration_template.yaml
@@ -192,7 +214,7 @@ All parameters live in [`config/passive_stereo.yaml`](config/passive_stereo.yaml
 | `slam_enabled` | `true` | Enable/disable the SLAM worker |
 | `slam_voc_file` | — | Path to ORB vocabulary `.txt` |
 | `slam_settings_file` | — | Path to ORB-SLAM3 stereo settings `.yaml` |
-| `slam_scale_factor` | `0.33` | Scale applied to gray image before tracking (e.g. 0.33 → ~808×676 from 2448×2048) |
+| `slam_scale_factor` | `1.0` | Scale applied to gray image before tracking (e.g. 0.33 → ~808×676 from 2448×2048) |
 | `slam_use_pangolin` | `false` | Open Pangolin visualizer (requires X11/display) |
 | `slam_enu_publish` | `true` | Rotate pose to ENU (East-North-Up) frame |
 | `slam_tf_publish` | `false` | Also broadcast TF transform |
@@ -208,7 +230,7 @@ All parameters live in [`config/passive_stereo.yaml`](config/passive_stereo.yaml
 | `sampling_factor` | `1.0` | Point cloud decimation: 0.5 = every other pixel |
 | `crop_factor` | `1.0` | Central crop fraction of the image |
 | `min_confidence` | `0.35` | Minimum local disparity confidence to keep a point |
-| `publish_confidence` | `true` | Add a `confidence` field to the point cloud |
+| `publish_confidence` | `true` | Filter by local disparity smoothness and publish its score |
 
 ### Preview (unrectified raw perspective, BGR8)
 
@@ -272,9 +294,9 @@ All topics are prefixed with `/Passive/` (configurable via `namespace` parameter
 | `/Passive/slam/pose_cov` | `PoseWithCovarianceStamped` | 30 | Camera pose in ENU map frame |
 | `/Passive/slam/pointcloud` | `PointCloud2` | ≤2 | Sparse ORB-SLAM3 map points |
 | `/Passive/slam/path` | `Path` | 30 | Pose history |
-| `/Passive/disparity/pointcloud` | `PointCloud2` | 30 | Dense Retinify depth cloud (XYZRGB[+conf]) |
-| `/Passive/left/preview/image/compressed` | `CompressedImage` | 30 | Left JPEG preview |
-| `/Passive/right/preview/image/compressed` | `CompressedImage` | 30 | Right JPEG preview |
+| `/Passive/disparity/pointcloud` | `PointCloud2` | ≤15 | Dense Retinify depth cloud (XYZRGB[+conf]) |
+| `/Passive/left/preview/image/compressed` | `CompressedImage` | ≤10 | Left JPEG preview |
+| `/Passive/right/preview/image/compressed` | `CompressedImage` | ≤10 | Right JPEG preview |
 
 ---
 

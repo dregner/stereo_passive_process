@@ -8,6 +8,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
 #include <cuda_runtime.h>
@@ -15,14 +16,16 @@
 #include "clahe_processor.hpp"
 #include "stereo_frame.hpp"
 #include "bounded_queue.hpp"
+#include "rate_limiter.hpp"
+#include "worker_metrics.hpp"
 #include "stereo_calib.hpp"
 
 namespace passive_stereo_capture
 {
 
 /// Runs the Retinify GPU stereo depth pipeline in a dedicated thread.
-/// Input: rectified RGB8 stereo pair (left/right — with CLAHE applied).
-/// Output: dense coloured PointCloud2 published to ROS 2.
+/// Input: RGB8 stereo pair (left/right).
+/// Output: dense coloured PointCloud2 and/or compressed disparity visualizer.
 class DisparityWorker
 {
 public:
@@ -38,14 +41,20 @@ public:
         std::string frame_id{"Passive/left_camera_link"};
         double clahe_clip{2.0};    ///< Grayscale CLAHE clip limit (applied after resize)
         int    clahe_tiles{8};     ///< Grayscale CLAHE tile grid size
-        bool  clahe_enabled{false}; ///< Apply CLAHE to preview images (Bayer→BGR8)
+        bool   clahe_enabled{false};
+        int width{0};                         ///< 0/0 = native; positive pair = software resize
+        int height{0};
+        double cloud_hz{15.0};      ///< Max frequency to publish pointcloud
+        double image_hz{10.0};     ///< Max frequency to publish disparity visualization
     };
 
-    using PointCloud2Pub = rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr;
+    using PointCloud2Pub     = rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr;
+    using CompressedImagePub = rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr;
 
     DisparityWorker(
         PointCloud2Pub pub_cloud,
-        const StereoCalib & rectifier,   ///< Used for calibration params (P1/P2/baseline)
+        CompressedImagePub pub_disp_img,
+        const StereoCalib & rectifier,
         const Config & cfg);
 
     ~DisparityWorker();
@@ -53,6 +62,14 @@ public:
     void push(StereoFramePtr frame);
     void start();
     void stop();
+
+    uint64_t processedFrames() const { return processed_frames_.load(); }
+
+    uint64_t publishedClouds() const { return published_clouds_.load(); }
+    uint64_t emptyClouds() const { return empty_clouds_.load(); }
+    uint64_t droppedFrames() const { return queue_.dropped(); }
+    double processingMs() const { return metrics_.process_ms.load(); }
+    double receiptAgeMs() const { return metrics_.receipt_age_ms.load(); }
 
 private:
     /// Packed point layouts
@@ -72,9 +89,10 @@ private:
 
     void run();
 
-    PointCloud2Pub pub_cloud_;
-    Config         cfg_;
-    StereoCalib    calib_;
+    PointCloud2Pub     pub_cloud_;
+    CompressedImagePub pub_disp_img_;
+    Config             cfg_;
+    StereoCalib        calib_;
     cv::Ptr<cv::CLAHE> clahe_{cv::createCLAHE(cfg_.clahe_clip, cv::Size(cfg_.clahe_tiles, cfg_.clahe_tiles))};
 
     retinify::Pipeline pipeline_;
@@ -88,14 +106,24 @@ private:
     size_t  pinned_xyz_bytes_{0};
     std::vector<float>   cpu_disp_buf_;
 
-    // FIX #9: Pre-allocated point output buffer (reused every frame)
+    // Pre-allocated point output buffer (reused every frame)
     std::vector<uint8_t> cpu_point_buf_;
-    // FIX #9: Pre-allocated, reused PointCloud2 message data buffer
-    std::vector<uint8_t> cloud_data_buf_;
+
+    // Buffer for rectified left RGB image from Retinify
+    uint8_t * h_pinned_rect_left_{nullptr};
+    size_t    pinned_rect_left_bytes_{0};
+    cv::Mat   rect_left_rgb_;
+
+    // Disparity image preview buffer
+    std::vector<uchar> disp_jpeg_buf_;
+    RateLimiter cloud_limiter_, image_limiter_;
 
     BoundedQueue<StereoFramePtr> queue_{1, /*drop_oldest=*/true};
-    std::thread      thread_;
+    WorkerMetrics metrics_;
+    std::thread       thread_;
     std::atomic<bool> running_{false};
+    std::atomic<uint64_t> processed_frames_{0};
+    std::atomic<uint64_t> published_clouds_{0}, empty_clouds_{0};
 };
 
 }  // namespace passive_stereo_capture

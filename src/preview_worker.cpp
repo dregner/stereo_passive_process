@@ -10,7 +10,6 @@ PreviewWorker::PreviewWorker(
     Publisher pub_left,
     Publisher pub_right,
     const Config & cfg)
-
 : pub_left_(std::move(pub_left)),
   pub_right_(std::move(pub_right)),
   cfg_(cfg)
@@ -25,7 +24,6 @@ void PreviewWorker::push(StereoFramePtr frame)
 
 void PreviewWorker::start()
 {
-    
     if (running_.load()) return;
     running_.store(true);
     thread_ = std::thread(&PreviewWorker::run, this);
@@ -45,10 +43,8 @@ void PreviewWorker::encodeAndPublish(
     const rclcpp::Time & stamp,
     const std::string & frame_id)
 {
-    if (rgb_img.empty()) return;
+    if (rgb_img.empty() || !pub || pub->get_subscription_count() == 0) return;
 
-    // Resize if target dimensions differ
-    
     cv::Mat resized;
     if (rgb_img.cols != cfg_.preview_width || rgb_img.rows != cfg_.preview_height) {
         cv::resize(rgb_img, resized, cv::Size(cfg_.preview_width, cfg_.preview_height),
@@ -56,15 +52,15 @@ void PreviewWorker::encodeAndPublish(
     } else {
         resized = rgb_img;
     }
+
+    cv::Mat bgr;
     if (cfg_.clahe_enabled) {
-        resized=applyClaheBGR(resized, clahe_);
+        bgr = applyClaheBGR(resized, clahe_);
+    } else {
+        cv::cvtColor(resized, bgr, cv::COLOR_RGB2BGR);
     }
-    else{
-        cv::cvtColor(resized, resized, cv::COLOR_BayerRG2BGR);
-    }
-    // Input is already BGR8 (the standard ROS 2 color space).
-    // cv::imencode expects BGR order by default, so we encode directly with zero conversion.
-    cv::imencode(".jpg", resized, buf, {cv::IMWRITE_JPEG_QUALITY, cfg_.jpeg_quality});
+
+    cv::imencode(".jpg", bgr, buf, {cv::IMWRITE_JPEG_QUALITY, cfg_.jpeg_quality});
 
     sensor_msgs::msg::CompressedImage msg;
     msg.header.stamp    = stamp;
@@ -76,30 +72,28 @@ void PreviewWorker::encodeAndPublish(
 
 void PreviewWorker::run()
 {
-
     while (running_.load()) {
         StereoFramePtr frame;
         if (!queue_.pop(frame)) continue;
 
-        // Rate limiting: throttle preview compression and publishing to max_fps
-        if (cfg_.max_fps > 0.0) {
-            if (!last_pub_time_init_) {
-                last_pub_time_init_ = true;
-                last_pub_time_ = frame->stamp;
-            } else {
-                double elapsed = (frame->stamp - last_pub_time_).seconds();
-                if (elapsed < (1.0 / cfg_.max_fps)) {
-                    continue; // Skip encoding and publishing this frame
-                }
-                last_pub_time_ = frame->stamp;
-            }
+        bool has_left_sub  = (pub_left_ && pub_left_->get_subscription_count() > 0);
+        bool has_right_sub = (pub_right_ && pub_right_->get_subscription_count() > 0);
+
+        // If no one is listening to preview, skip heavy resize and JPEG compression completely!
+        if (!has_left_sub && !has_right_sub) {
+            continue;
         }
 
-        // Preview publishes unrectified (raw perspective) BGR8 images directly
-        encodeAndPublish(frame->left_rgb,   pub_left_,  buf_left_,
-                         frame->stamp, "Passive/left_camera_link");
-        encodeAndPublish(frame->right_rgb, pub_right_, buf_right_,
-                         frame->stamp, "Passive/right_camera_link");
+        if (cfg_.max_fps > 0.0 && !limiter_.ready(frame->stamp.seconds(), cfg_.max_fps)) continue;
+
+        if (has_left_sub) {
+            encodeAndPublish(frame->left_rgb,   pub_left_,  buf_left_,
+                            frame->stamp, "Passive/left_camera_link");
+        }
+        if (has_right_sub) {
+            encodeAndPublish(frame->right_rgb, pub_right_, buf_right_,
+                            frame->stamp, "Passive/right_camera_link");
+        }
     }
 }
 

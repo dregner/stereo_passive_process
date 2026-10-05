@@ -26,17 +26,15 @@
 
 #include "stereo_frame.hpp"
 #include "bounded_queue.hpp"
+#include "worker_metrics.hpp"
 
 namespace passive_stereo_capture
 {
 
 /// Wraps ORB-SLAM3 stereo tracking in a dedicated thread.
 ///
-/// Input: StereoFrame::left_gray / right_gray (CV_8UC1, rectified, full-res).
-///   BayerRG→GRAY conversion already done in preprocessThread (single-step, efficient).
-///   SLAM resizes using scale_factor and applies grayscale CLAHE.
-///
-/// Output: PoseWithCovarianceStamped + sparse PointCloud2 (throttled).
+/// Input: StereoFrame::left_raw / right_raw (BayerRG8, converted directly to GRAY).
+/// SLAM resizes using scale_factor (or keeps 1.0 if width <= 800) and applies grayscale CLAHE.
 class SlamWorker
 {
 public:
@@ -44,16 +42,16 @@ public:
         std::string voc_file;
         std::string settings_file;
         bool use_pangolin{false};
-        double scale_factor{1.0};  ///< Scale applied to input before TrackStereo (e.g. 0.33 for 800x600 from 2448x2048)
+        double scale_factor{1.0};
         std::string frame_id{"map"};
         std::string parent_frame_id{"base_link"};
         std::string child_frame_id{"Passive/left_camera_link"};
         bool enu_publish{true};
         bool tf_publish{false};
-        double cloud_pub_hz{2.0};  ///< Max rate to call GetAllMapPoints (acquires mutex)
-        double clahe_clip{2.0};    ///< Grayscale CLAHE clip limit (applied after resize)
-        int    clahe_tiles{8};     ///< Grayscale CLAHE tile grid size
-        bool  clahe_enabled{false}; ///< Apply CLAHE to preview images (Bayer→BGR8)
+        double cloud_pub_hz{2.0};
+        double clahe_clip{2.0};
+        int    clahe_tiles{8};
+        bool   clahe_enabled{false};
     };
 
     using PosePub   = rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr;
@@ -76,6 +74,13 @@ public:
     /// Thread-safe reset: applied at the top of the next run() iteration.
     void reset();
 
+    int lastTrackingState() const { return last_tracking_state_.load(); }
+    uint64_t processedFrames() const { return processed_frames_.load(); }
+
+    uint64_t droppedFrames() const { return queue_.dropped(); }
+    double processingMs() const { return metrics_.process_ms.load(); }
+    double receiptAgeMs() const { return metrics_.receipt_age_ms.load(); }
+
 private:
     void run();
     void publishPose(const Sophus::SE3f & se3, const rclcpp::Time & stamp, int tracking_state);
@@ -83,7 +88,6 @@ private:
     tf2::Transform sophusToTf(const Sophus::SE3f & pose);
     void tryLookupTf();
 
-    // ENU rotation: ORB-SLAM (Z-forward, X-right, Y-down) -> ROS ENU (X-forward, Y-left, Z-up)
     static const tf2::Matrix3x3 kOrbToRosEnu;
 
     rclcpp::Node * node_;
@@ -93,10 +97,9 @@ private:
     Config   cfg_;
 
     std::shared_ptr<tf2_ros::Buffer>               tf_buffer_;
-    std::shared_ptr<tf2_ros::TransformListener>    tf_listener_;  // kept alive to fill buffer
+    std::shared_ptr<tf2_ros::TransformListener>    tf_listener_;
     std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
-    // Exception-safe ownership: destructor calls Shutdown() + delete
     struct SlamDeleter {
         void operator()(ORB_SLAM3::System * s) const {
             if (s) { s->Shutdown(); delete s; }
@@ -109,18 +112,19 @@ private:
     bool tf_cached_{false};
     bool initial_offset_set_{false};
 
-    // Throttle map cloud publish
+    nav_msgs::msg::Path path_msg_;
+
     rclcpp::Time last_cloud_pub_;
     bool         last_cloud_pub_init_{false};
 
-    // Atomic reset flag — avoids race between service thread and run() thread
     std::atomic<bool> reset_requested_{false};
+    std::atomic<int>  last_tracking_state_{-1};
+    std::atomic<uint64_t> processed_frames_{0};
 
-    // Grayscale CLAHE applied post-resize (efficient — small image only)
-    // cv::Ptr<cv::CLAHE> clahe_gray_;
     cv::Ptr<cv::CLAHE> clahe_gray_{cv::createCLAHE(cfg_.clahe_clip, cv::Size(cfg_.clahe_tiles, cfg_.clahe_tiles))};
 
-    BoundedQueue<StereoFramePtr> queue_{2, /*drop_oldest=*/false};
+    BoundedQueue<StereoFramePtr> queue_{1, /*drop_oldest=*/true};
+    WorkerMetrics metrics_;
     std::thread       thread_;
     std::atomic<bool> running_{false};
 };
