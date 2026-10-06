@@ -1,8 +1,8 @@
 passive_stereo_node:
   ros__parameters:
     # ---- Camera serials (match your BFS cameras) --------------------------
-    cam_left_serial:  "23267854"
-    cam_right_serial: "23267852"
+    cam_left_serial:  "16378753"
+    cam_right_serial: "16378754"
 
     # ---- Acquisition settings -------------------------------------------
     frame_rate:         30.0
@@ -31,22 +31,23 @@ passive_stereo_node:
     # ---- Stereo calibration ---------------------------------------------
     # OpenCV FileStorage YAML with K1, D1, K2, D2, R, T matrices.
     # See config/stereo_calibration_template.yaml for the format.
-    calibration_file: "/home/daniel/ros2_ws/src/passive_stereo_capture/config/stereo_calibration_bfs.yaml"
+    calibration_file: "/home/jetson/ros2_ws/src/passive_stereo_capture/config/stereo_calibration_lab.yaml"
 
     # ---- CLAHE (full-res Lab L-channel, for Retinify + Preview) ---------
     # SLAM receives raw rectified and applies its own grayscale CLAHE post-resize.
     clahe_clip_limit: 2.0
     clahe_tile_size:  8
     enable_clahe: false
+
     # ---- SLAM (ORB-SLAM3) ------------------------------------------------
     slam_enabled: true
-    slam_voc_file: "/home/daniel/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/vocabulary/ORBvoc.txt"
-    slam_settings_file: "/home/daniel/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/config/stereo_bluerov.yaml"
+    slam_voc_file: "/home/jetson/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/vocabulary/ORBvoc.txt"
+    slam_settings_file: "/home/jetson/ros2_ws/src/voris_bringup/config/20260717_passivo_slam.yaml"
     slam_use_pangolin: false   # set true to open Pangolin viewer (needs X11)
-    slam_scale_factor: 0.25     # 2448×2048 * 0.25 ≈ 612×512 — set 1.0 for full resolution
+    slam_scale_factor: 0.5   
     slam_enu_publish: true
     slam_tf_publish:  false
-    slam_cloud_hz:    2.0      # max rate to publish sparse map cloud (GetAllMapPoints is expensive)
+    slam_cloud_hz:    5.0      # max rate to publish sparse map cloud (GetAllMapPoints is expensive)
 
     # ---- Coordinate frames -----------------------------------------------
     namespace:        "Passive"
@@ -62,8 +63,8 @@ passive_stereo_node:
     disp_image_hz:      10.0
     depth_mode:       "accurate"   # "fast" | "balanced" | "accurate"
     max_dist:         15.0         # metres; 0 = no limit
-    sampling_factor:  1.0          # point cloud decimation (0-1]: 0.5 = every other pixel
-    crop_factor:      1.0          # central crop fraction (0-1]
+    sampling_factor:  0.5          # point cloud decimation (0-1]: 0.5 = every other pixel
+    crop_factor:      1.0         # central crop fraction (0-1]
     min_confidence:   0.35
     confidence_radius: 2
     confidence_alpha: 2.0
@@ -72,7 +73,7 @@ passive_stereo_node:
 
     # ---- Preview streaming (unrectified raw perspective) ----------------
     preview_enabled: true
-    preview_width:   720
-    preview_height:  540
-    preview_quality: 50    # JPEG quality 0-100
-    preview_fps:     15.0  # Max publishing rate for preview (e.g. 10.0 Hz)
+    preview_width:   800
+    preview_height:  600
+    preview_quality: 30    # JPEG quality 0-100
+    preview_fps:     30.0  # Max publishing rate for preview (e.g. 10.0 Hz)

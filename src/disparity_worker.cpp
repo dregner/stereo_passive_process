@@ -62,8 +62,9 @@ bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
 
     if (std::abs(sx - 1.0) > 1e-3 || std::abs(sy - 1.0) > 1e-3) {
         std::cout << "[DisparityWorker] Scaling calibration parameters by ("
-                  << sx << ", " << sy << ") to match frame size " << W << "x" << H << "\n";
+                  << sx << ", " << sy << ") to match frame size " << W << "x" << H << std::endl;
     }
+    else std::cout << "[DisparityWorker] No scaling factor: " << sx << ", " << sy << std::endl;
 
     calib.leftIntrinsics.fx  = calib_.fx_l() * sx;
     calib.leftIntrinsics.fy  = calib_.fy_l() * sy;
@@ -81,7 +82,7 @@ bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
     auto status = pipeline_.Initialize(W, H, retinify::PixelFormat::RGB8, mode, calib);
     if (!status.IsOK()) {
         std::cerr << "[DisparityWorker] Retinify Initialize failed with code "
-                  << static_cast<int>(status.Code()) << "\n";
+                  << static_cast<int>(status.Code()) << std::endl;
         return false;
     }
 
@@ -280,7 +281,7 @@ void DisparityWorker::run()
                 h_pinned_xyz_, static_cast<size_t>(W) * 3 * sizeof(float));
             if (!pc_status.IsOK()) {
                 std::cerr << "[DisparityWorker] RetrievePointCloud failed: code "
-                          << static_cast<int>(pc_status.Code()) << "\n";
+                          << static_cast<int>(pc_status.Code()) << std::endl;
                 continue;
             }
 
