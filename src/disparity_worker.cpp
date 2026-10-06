@@ -258,21 +258,19 @@ void DisparityWorker::run()
 
         // 1. Lightweight Disparity Image Visualizer (Colormap Jet)
         if (pub_img_now && disp_retrieved) {
-            cv::Mat disp_mat(static_cast<int>(H), static_cast<int>(W), CV_32FC1, disp_ptr);
-            cv::Mat disp_8u;
-            // Normalize disparity for visualization (max disparity ~ 64 - 128)
-            disp_mat.convertTo(disp_8u, CV_8UC1, 255.0 / 64.0);
-            cv::Mat disp_color;
-            cv::applyColorMap(disp_8u, disp_color, cv::COLORMAP_JET);
+            cv::Mat disp_colored(static_cast<size_t>(H), static_cast<size_t>(W), CV_8UC3);
+            auto col_status = retinify::ColorizeDisparity(disp_ptr, W*sizeof(float), disp_colored.ptr<uint8_t>(), disp_colored.step[0], W, H, 256.0f);
+            if(col_status.IsOK()){
+                cv::cvtColor(disp_colored, disp_colored, cv::COLOR_RGB2BGR);
+                cv::imencode(".jpg", disp_colored, disp_jpeg_buf_, {cv::IMWRITE_JPEG_QUALITY, 20});
 
-            cv::imencode(".jpg", disp_color, disp_jpeg_buf_, {cv::IMWRITE_JPEG_QUALITY, 60});
-
-            sensor_msgs::msg::CompressedImage img_msg;
-            img_msg.header.stamp    = frame->stamp;
-            img_msg.header.frame_id = cfg_.frame_id;
-            img_msg.format          = "jpeg";
-            img_msg.data            = disp_jpeg_buf_;
-            pub_disp_img_->publish(img_msg);
+                sensor_msgs::msg::CompressedImage img_msg;
+                img_msg.header.stamp    = frame->stamp;
+                img_msg.header.frame_id = cfg_.frame_id;
+                img_msg.format          = "jpeg";
+                img_msg.data            = disp_jpeg_buf_;
+                pub_disp_img_->publish(img_msg);
+            }
         }
 
         // 2. Heavy Dense PointCloud2 (only computed when someone is subscribed and throttled)
