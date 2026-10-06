@@ -68,7 +68,23 @@ void StereoCalib::load(const std::string & calib_yaml_path)
     if (R_.type()  != CV_64F) R_.convertTo(R_, CV_64F);
     if (T_.type()  != CV_64F) T_.convertTo(T_, CV_64F);
 
+    cv::Mat R1, R2;
+    cv::stereoRectify(K1_, D1_, K2_, D2_, img_size_, R_, T_, R1, R2, P1_, P2_, Q_,
+        cv::CALIB_ZERO_DISPARITY, /*alpha=*/0.0, img_size_);
+
+    // Pre-compute undistort + rectify maps
+    cv::initUndistortRectifyMap(K1_, D1_, R1, P1_, img_size_, CV_16SC2,
+                                map1_left_, map2_left_);
+    cv::initUndistortRectifyMap(K2_, D2_, R2, P2_, img_size_, CV_16SC2,
+                                map1_right_, map2_right_);
+    baseline_m_ = std::abs(P2_.at<double>(0,3)/P2_.at<double>(0,0));
     loaded_ = true;
+}
+
+void StereoCalib::rectify( const cv::Mat & left_raw, const cv::Mat & right_raw, cv::Mat & left_rect, cv::Mat & right_rect) const
+{
+    cv::remap(left_raw,  left_rect,  map1_left_,  map2_left_,  cv::INTER_LINEAR);
+    cv::remap(right_raw, right_rect, map1_right_, map2_right_, cv::INTER_LINEAR);
 }
 
 }  // namespace passive_stereo_capture

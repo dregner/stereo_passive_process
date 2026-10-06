@@ -65,19 +65,30 @@ bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
                   << sx << ", " << sy << ") to match frame size " << W << "x" << H << std::endl;
     }
     else std::cout << "[DisparityWorker] No scaling factor: " << sx << ", " << sy << std::endl;
-
-    calib.leftIntrinsics.fx  = calib_.fx_l() * sx;
-    calib.leftIntrinsics.fy  = calib_.fy_l() * sy;
-    calib.leftIntrinsics.cx  = calib_.cx_l() * sx;
-    calib.leftIntrinsics.cy  = calib_.cy_l() * sy;
-    calib.rightIntrinsics.fx = calib_.fx_r() * sx;
-    calib.rightIntrinsics.fy = calib_.fy_r() * sy;
-    calib.rightIntrinsics.cx = calib_.cx_r() * sx;
-    calib.rightIntrinsics.cy = calib_.cy_r() * sy;
-    calib.leftDistortion     = calib_.toRetinifyDistortion(calib_.leftDistortions());
-    calib.rightDistortion    = calib_.toRetinifyDistortion(calib_.rightDistortions());
-    calib.rotation           = calib_.rot();
-    calib.translation        = calib_.trans();
+    if(!rectify_){
+        calib.leftIntrinsics.fx  = calib_.fx_l() * sx;
+        calib.leftIntrinsics.fy  = calib_.fy_l() * sy;
+        calib.leftIntrinsics.cx  = calib_.cx_l() * sx;
+        calib.leftIntrinsics.cy  = calib_.cy_l() * sy;
+        calib.rightIntrinsics.fx = calib_.fx_r() * sx;
+        calib.rightIntrinsics.fy = calib_.fy_r() * sy;
+        calib.rightIntrinsics.cx = calib_.cx_r() * sx;
+        calib.rightIntrinsics.cy = calib_.cy_r() * sy;
+        calib.leftDistortion     = calib_.toRetinifyDistortion(calib_.leftDistortions());
+        calib.rightDistortion    = calib_.toRetinifyDistortion(calib_.rightDistortions());
+        calib.rotation           = calib_.rot();
+        calib.translation        = calib_.trans();
+    }
+    else{
+        cv::Mat P2 = calib_.P2();
+        calib.leftIntrinsics.fx  = P2.at<double>(0,0) * sx;
+        calib.leftIntrinsics.fy  = P2.at<double>(1,1) * sy;
+        calib.leftIntrinsics.cx  = P2.at<double>(0,2) * sx;
+        calib.leftIntrinsics.cy  = P2.at<double>(1,2) * sy;
+        calib.rightIntrinsics = calib.leftIntrinsics;
+        calib.rotation           = retinify::Identity();
+        calib.translation        = {-calib_.baseline(), 0, 0};
+    }
 
     auto status = pipeline_.Initialize(W, H, retinify::PixelFormat::RGB8, mode, calib);
     if (!status.IsOK()) {
@@ -204,8 +215,12 @@ void DisparityWorker::run()
         StereoFramePtr frame;
         if (!queue_.pop(frame)) continue;
         const auto processing_start = std::chrono::steady_clock::now();
-
-        cv::Mat input_left = frame->left_rgb, input_right = frame->right_rgb;
+        cv::Mat input_left, input_right;
+        if(rectify_){
+            input_left = frame->left_rgb, input_right = frame->right_rgb;
+        }else{
+            calib_.rectify(frame->left_rgb, frame->right_rgb, input_left, input_right);
+        }
         if (cfg_.width > 0 && cfg_.height > 0 &&
             (input_left.cols != cfg_.width || input_left.rows != cfg_.height)) {
             const auto interpolation = cfg_.width < input_left.cols && cfg_.height < input_left.rows
@@ -282,14 +297,19 @@ void DisparityWorker::run()
                           << static_cast<int>(pc_status.Code()) << std::endl;
                 continue;
             }
-
-            uint8_t * color_ptr = rect_left_rgb_.ptr<uint8_t>();
-            std::size_t color_stride = rect_left_rgb_.step[0];
-            auto rect_status = pipeline_.RetrieveRectifiedLeftImage(color_ptr, color_stride);
-            if (!rect_status.IsOK()) {
-                // Unrectified color would not align with rectified XYZ.
-                continue;
+            uint8_t * color_ptr;
+            std::size_t color_stride;
+            if(rectify_){
+                color_ptr = rect_left_rgb_.ptr<uint8_t>();
+                color_stride = rect_left_rgb_.step[0];
+                auto rect_status = pipeline_.RetrieveRectifiedLeftImage(color_ptr, color_stride);
+                if (!rect_status.IsOK()) {
+                    // Unrectified color would not align with rectified XYZ.
+                    continue;
+                }
             }
+            else{ color_ptr = input_left.ptr<uint8_t>(); color_stride = input_left.step[0];}
+
 
             float  sampling = static_cast<float>(std::clamp(cfg_.sampling_factor, 0.01, 1.0));
             int    step_px  = std::max(1, static_cast<int>(1.f / sampling));

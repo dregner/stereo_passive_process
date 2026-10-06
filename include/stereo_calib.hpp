@@ -28,7 +28,13 @@
 
         bool isLoaded() const { return loaded_; }
 
+        /// Rectify a raw stereo pair
+        void rectify(const cv::Mat & left_raw, const cv::Mat & right_raw, cv::Mat & left_rect, cv::Mat & right_rect) const;
+
         // Accessors for downstream consumers (Retinify, SLAM config)
+        const cv::Mat & Q() const { return Q_; }          ///< disparity-to-depth mapping
+        const cv::Mat & P1() const { return P1_; }
+        const cv::Mat & P2() const { return P2_; }
         int width()      const { return img_size_.width;  }
         int height()     const { return img_size_.height; }
         double fx_l()      const { return K1_.at<double>(0, 0); }
@@ -62,8 +68,12 @@
 
     private:
         cv::Mat K1_, D1_, K2_, D2_, R_, T_;  ///< Raw calibration matrices from YAML
-        cv::Size img_size_;    
+        cv::Size img_size_;
+        cv::Mat map1_left_,  map2_left_;    ///< remap maps for left camera
+        cv::Mat map1_right_, map2_right_;   ///< remap maps for right camera
+        cv::Mat P1_, P2_, Q_;
         bool loaded_{false};
+        double baseline_m_{0.0};
     };
 
     }  // namespace passive_stereo_capture

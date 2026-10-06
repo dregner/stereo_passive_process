@@ -91,12 +91,14 @@ private:
 
     PointCloud2Pub     pub_cloud_;
     CompressedImagePub pub_disp_img_;
+
     Config             cfg_;
     StereoCalib        calib_;
     cv::Ptr<cv::CLAHE> clahe_{cv::createCLAHE(cfg_.clahe_clip, cv::Size(cfg_.clahe_tiles, cfg_.clahe_tiles))};
 
     retinify::Pipeline pipeline_;
     bool               pipeline_init_{false};
+    bool               rectify_{true};
     uint32_t           pipeline_W_{0};  // cached pipeline width — detect resolution changes
     uint32_t           pipeline_H_{0};
 
