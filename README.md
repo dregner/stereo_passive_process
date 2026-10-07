@@ -398,3 +398,99 @@ Expected — `HAVE_GPIOD` is not defined and GPIO trigger is compiled as a no-op
 ## License
 
 See [LICENSE](LICENSE).
+
+### Conventional CPU disparity
+
+Set `disparity_backend: "stereosgbm"` (OpenCV SGBM 3-way) or
+`disparity_backend: "stereobm"`, or `disparity_backend: "stereobinary"`
+(OpenCV contrib StereoBinarySGBM) in your parameter YAML. The default remains
+`"retinify"`. All CPU backends publish through the existing disparity JPEG and
+XYZRGB point-cloud topics, using the same publication rates, crop, sampling,
+distance limit, and optional local smoothness confidence filter.
+
+CPU matching rectifies the RGB pair using the stereo calibration, resizes to
+`depth_width` / `depth_height` when configured, and matches grayscale images.
+The calibration Q matrix is adjusted for the resized pixel coordinates and
+disparities before reconstruction in metres. Invalid or nonpositive disparities
+are excluded from the cloud and shown black in the JPEG.
+
+| Parameter | Default | Meaning |
+|---|---:|---|
+| `stereo_min_disparity` | 0 | Minimum searched disparity in output-image pixels (nonnegative) |
+| `stereo_num_disparities` | 128 | Search span; positive multiple of 16 |
+| `stereo_block_size` | 9 | Odd block size; BM requires 5–255, SGBM 1–255 |
+| `stereo_uniqueness_ratio` | 10 | Match uniqueness margin (%) |
+| `stereo_speckle_window_size` | 100 | Remove small disparity regions; 0 disables |
+| `stereo_speckle_range` | 2 | Speckle disparity tolerance in pixels |
+| `stereo_disp12_max_diff` | 1 | Left/right consistency tolerance; nonpositive disables |
+| `stereo_pre_filter_cap` | 31 | Prefilter clipping (1–63) |
+| `stereo_texture_threshold` | 10 | BM texture rejection threshold |
+
+SGBM uses grayscale smoothness penalties P1=8×block_size² and
+P2=32×block_size². See the [OpenCV StereoSGBM documentation](https://docs.opencv.org/4.x/d2/d85/classcv_1_1StereoSGBM.html)
+and [StereoBM documentation](https://docs.opencv.org/4.x/d9/dba/classcv_1_1StereoBM.html).
+For an initial CPU configuration, try `depth_width: 800`, `depth_height: 600`,
+and tune the disparity search at that resolution. The search plus block size
+must fit within the image width. Calibration must describe a horizontal stereo
+rig, with translation expressed in metres. CPU backend selection avoids Retinify
+execution and pinned-memory allocation; the package still requires its existing
+Retinify/CUDA build dependencies.
+
+With `BUILD_TESTING=ON`, `conventional_stereo_test` checks all three matchers against
+synthetic stereo pairs with a known shift, invalid matches, parameter validation,
+and metric reconstruction after resizing.
+
+`stereobinary` uses binary descriptors with SGBM aggregation, with P1=100 and
+P2=1000. Constant left-image patches (local grayscale variance below 1) are
+masked to reject arbitrary matches. It shares the `stereo_*` matching parameters; `stereo_texture_threshold`
+is BM-only. The OpenCV contrib `stereo` module is required at build time.
+See [OpenCV StereoBinarySGBM](https://docs.opencv.org/4.10.0/d1/d9f/classcv_1_1stereo_1_1StereoBinarySGBM.html).
+
+
+## Standalone stereo camera GUI
+
+Run without ROS, SLAM, or disparity processing:
+
+```bash
+./tools/stereo_camera_gui.sh config/passive_stereo_pc.yaml /tmp/stereo_capture
+```
+
+The launcher compiles a small C++ viewer using the installed Spinnaker SDK,
+OpenCV HighGUI, yaml-cpp, and a C++17 compiler. The compiled executable is cached
+under `/tmp/passive_stereo_gui_$UID` (override with `STEREO_GUI_BUILD_DIR`).
+Stop other camera acquisition programs before launching it.
+
+The YAML can use the existing `passive_stereo_node.ros__parameters` structure or
+flat camera parameters. Both camera serials must match exactly. Acquisition uses
+continuous free-running mode, full native Width/Height, and minimum binning and
+decimation, regardless of the YAML preview size, binning, or trigger setting.
+The two latest retrieved images form a pair; free-running cameras do not guarantee
+simultaneous exposures. Use a hardware-synchronized acquisition pipeline when
+exposure synchronization is required.
+
+A fullscreen OpenCV window presents the native-resolution left/right images
+concatenated horizontally. OpenCV fits the view to the screen while preserving
+aspect ratio; the source and saved images retain every pixel. Press **F** to toggle
+fullscreen, **S** to save, or **Q/Esc** to exit. The separate controls window has a
+**Save image pair** button and trackbars that apply to both cameras:
+
+- Exposure time in microseconds and gain in 0.1 dB steps.
+- Exposure auto and gain auto: 0 = Off/manual, 1 = Once, 2 = Continuous.
+- White balance auto with the same three modes, plus manual red/blue ratios in
+  0.01 steps. Manual values apply when the corresponding auto mode is Off.
+
+Exposure uses the camera's Timed mode; the exposure mode control selects automatic
+versus manual exposure, rather than TriggerWidth acquisition. Unsupported or locked
+camera features are reported in the controls window and terminal. Float settings
+are clamped to camera limits; long exposures can lower the achieved frame rate.
+To run Once again, move its mode control away from 1 and back.
+
+The output argument selects the parent folder. Captures are saved as
+`left/L000.png`, `right/R000.png`, then `L001.png`/`R001.png`, and so on. Existing
+numbers are skipped, including when only one side exists. Saved images are BGR8
+color PNGs with no overlays or resizing. The default output is `./stereo_pairs`.
+
+Initial settings use `exposure_time`, `gain`, `gain_auto`, and `balance_white_auto`
+from the YAML. Optional additions are `exposure_auto`, `gain_mode`, and
+`white_balance_mode` (`Off`, `Once`, or `Continuous`), plus `balance_ratio_red`
+and `balance_ratio_blue` (default 1.5).

@@ -20,7 +20,14 @@ DisparityWorker::DisparityWorker(
   pub_disp_img_(std::move(pub_disp_img)),
   cfg_(cfg),
   calib_(calib)
-{}
+{
+    if (cfg_.backend != "retinify") {
+        if (!calib_.isLoaded() || std::abs(calib_.P2().at<double>(0, 3)) < 1e-12 ||
+            std::abs(calib_.P2().at<double>(1, 3)) > 1e-12)
+            throw std::invalid_argument("Conventional stereo requires loaded horizontal stereo calibration");
+        conventional_ = std::make_unique<ConventionalStereo>(cfg_.backend, cfg_.stereo);
+    }
+}
 
 DisparityWorker::~DisparityWorker()
 {
@@ -193,7 +200,7 @@ size_t DisparityWorker::compactCloud(
                 }
             }
 
-            uint8_t r = img_row[u*3+0], g = img_row[u*3+1], b = img_row[u*3+2];
+            uint8_t r = img_row[u*3+2], g = img_row[u*3+1], b = img_row[u*3+0];
             uint32_t rgb = (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
 
             if (with_conf) {
@@ -216,7 +223,16 @@ void DisparityWorker::run()
         if (!queue_.pop(frame)) continue;
         const auto processing_start = std::chrono::steady_clock::now();
         cv::Mat input_left, input_right;
-        if(rectify_){
+        if (conventional_) {
+            // Rectification maps use calibration dimensions, including with camera binning.
+            cv::Mat native_left = frame->left_rgb, native_right = frame->right_rgb;
+            const cv::Size native_size(calib_.width(), calib_.height());
+            if (native_left.size() != native_size) {
+                cv::resize(frame->left_rgb, native_left, native_size);
+                cv::resize(frame->right_rgb, native_right, native_size);
+            }
+            calib_.rectify(native_left, native_right, input_left, input_right);
+        } else if(rectify_){
             input_left = frame->left_rgb, input_right = frame->right_rgb;
         }else{
             calib_.rectify(frame->left_rgb, frame->right_rgb, input_left, input_right);
@@ -225,13 +241,13 @@ void DisparityWorker::run()
             (input_left.cols != cfg_.width || input_left.rows != cfg_.height)) {
             const auto interpolation = cfg_.width < input_left.cols && cfg_.height < input_left.rows
                 ? cv::INTER_AREA : cv::INTER_LINEAR;
-            cv::resize(frame->left_rgb, input_left, cv::Size(cfg_.width, cfg_.height), 0, 0, interpolation);
-            cv::resize(frame->right_rgb, input_right, cv::Size(cfg_.width, cfg_.height), 0, 0, interpolation);
+            cv::resize(input_left, input_left, cv::Size(cfg_.width, cfg_.height), 0, 0, interpolation);
+            cv::resize(input_right, input_right, cv::Size(cfg_.width, cfg_.height), 0, 0, interpolation);
         }
         uint32_t W = static_cast<uint32_t>(input_left.cols);
         uint32_t H = static_cast<uint32_t>(input_left.rows);
 
-        if (!pipeline_init_ || pipeline_W_ != W || pipeline_H_ != H) {
+        if (!conventional_ && (!pipeline_init_ || pipeline_W_ != W || pipeline_H_ != H)) {
             if (!initPipeline(W, H)) {
                 std::cerr << "[DisparityWorker] Failed to initialize Retinify pipeline for "
                           << W << "x" << H << "!\n";
@@ -248,10 +264,19 @@ void DisparityWorker::run()
             right_rgb = input_right;
         }
 
-        auto status = pipeline_.Execute(
-            left_rgb.ptr<uint8_t>(),  left_rgb.step[0],
-            right_rgb.ptr<uint8_t>(), right_rgb.step[0]);
-        if (!status.IsOK()) continue;
+        if (conventional_) {
+            try {
+                conventional_->compute(left_rgb, right_rgb, conventional_disp_);
+            } catch (const std::exception & e) {
+                std::cerr << "[DisparityWorker] " << e.what() << std::endl;
+                continue;
+            }
+        } else {
+            auto status = pipeline_.Execute(
+                left_rgb.ptr<uint8_t>(), left_rgb.step[0],
+                right_rgb.ptr<uint8_t>(), right_rgb.step[0]);
+            if (!status.IsOK()) continue;
+        }
 
         processed_frames_++;
         metrics_.record(processing_start, frame->received_at);
@@ -264,9 +289,9 @@ void DisparityWorker::run()
         const bool pub_img_now = has_img_sub && image_limiter_.ready(stamp_sec, cfg_.image_hz);
 
         // Retrieve disparity if needed for pointcloud confidence gating OR for image publishing
-        float * disp_ptr = h_pinned_disp_ ? h_pinned_disp_ : cpu_disp_buf_.data();
-        bool disp_retrieved = false;
-        if (pub_img_now || (pub_cloud_now && cfg_.publish_confidence)) {
+        float * disp_ptr = conventional_ ? conventional_disp_.ptr<float>() : h_pinned_disp_ ? h_pinned_disp_ : cpu_disp_buf_.data();
+        bool disp_retrieved = static_cast<bool>(conventional_);
+        if (!conventional_ && (pub_img_now || (pub_cloud_now && cfg_.publish_confidence))) {
             auto disp_status = pipeline_.RetrieveDisparity(disp_ptr, W * sizeof(float));
             disp_retrieved = disp_status.IsOK();
         }
@@ -274,9 +299,20 @@ void DisparityWorker::run()
         // 1. Lightweight Disparity Image Visualizer (Colormap Jet)
         if (pub_img_now && disp_retrieved) {
             cv::Mat disp_colored(static_cast<size_t>(H), static_cast<size_t>(W), CV_8UC3);
-            auto col_status = retinify::ColorizeDisparity(disp_ptr, W*sizeof(float), disp_colored.ptr<uint8_t>(), disp_colored.step[0], W, H, 256.0f);
-            if(col_status.IsOK()){
-                cv::cvtColor(disp_colored, disp_colored, cv::COLOR_RGB2BGR);
+            bool colorized = false;
+            if (conventional_) {
+                cv::Mat normalized;
+                conventional_disp_.convertTo(normalized, CV_8U, 255.0 / cfg_.stereo.num_disparities,
+                    -255.0 * cfg_.stereo.min_disparity / cfg_.stereo.num_disparities);
+                cv::applyColorMap(normalized, disp_colored, cv::COLORMAP_JET);
+                disp_colored.setTo(cv::Scalar::all(0), conventional_disp_ != conventional_disp_);
+                colorized = true;
+            } else {
+                auto col_status = retinify::ColorizeDisparity(disp_ptr, W*sizeof(float), disp_colored.ptr<uint8_t>(), disp_colored.step[0], W, H, 256.0f);
+                colorized = col_status.IsOK();
+                // if (colorized) cv::cvtColor(disp_colored, disp_colored, cv::COLOR_RGB2BGR);
+            }
+            if (colorized) {
                 cv::imencode(".jpg", disp_colored, disp_jpeg_buf_, {cv::IMWRITE_JPEG_QUALITY, 20});
 
                 sensor_msgs::msg::CompressedImage img_msg;
@@ -289,17 +325,27 @@ void DisparityWorker::run()
         }
 
         // 2. Heavy Dense PointCloud2 (only computed when someone is subscribed and throttled)
-        if (pub_cloud_now && h_pinned_xyz_) {
-            auto pc_status = pipeline_.RetrievePointCloud(
-                h_pinned_xyz_, static_cast<size_t>(W) * 3 * sizeof(float));
-            if (!pc_status.IsOK()) {
-                std::cerr << "[DisparityWorker] RetrievePointCloud failed: code "
-                          << static_cast<int>(pc_status.Code()) << std::endl;
-                continue;
+        if (pub_cloud_now && (conventional_ || h_pinned_xyz_)) {
+            const float * xyz_ptr = h_pinned_xyz_;
+            if (conventional_) {
+                cv::reprojectImageTo3D(conventional_disp_, conventional_xyz_,
+                    ConventionalStereo::scaledQ(calib_.Q(), cv::Size(calib_.width(), calib_.height()),
+                        input_left.size()), false, CV_32F);
+                xyz_ptr = conventional_xyz_.ptr<float>();
+                cpu_point_buf_.resize(static_cast<size_t>(W) * H *
+                    (cfg_.publish_confidence ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB)));
+            } else {
+                auto pc_status = pipeline_.RetrievePointCloud(
+                    h_pinned_xyz_, static_cast<size_t>(W) * 3 * sizeof(float));
+                if (!pc_status.IsOK()) {
+                    std::cerr << "[DisparityWorker] RetrievePointCloud failed: code "
+                              << static_cast<int>(pc_status.Code()) << std::endl;
+                    continue;
+                }
             }
             uint8_t * color_ptr;
             std::size_t color_stride;
-            if(rectify_){
+            if(!conventional_ && rectify_){
                 color_ptr = rect_left_rgb_.ptr<uint8_t>();
                 color_stride = rect_left_rgb_.step[0];
                 auto rect_status = pipeline_.RetrieveRectifiedLeftImage(color_ptr, color_stride);
@@ -323,7 +369,7 @@ void DisparityWorker::run()
             bool wconf = cfg_.publish_confidence && disp_retrieved;
 
             size_t valid = compactCloud(
-                h_pinned_xyz_, color_ptr,
+                xyz_ptr, color_ptr,
                 W, H, u0, v0, u1, v1, step_px,
                 mdsq, static_cast<int>(color_stride),
                 cpu_point_buf_.data(), wconf,

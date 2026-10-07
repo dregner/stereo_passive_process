@@ -57,7 +57,8 @@ void PreviewWorker::encodeAndPublish(
     if (cfg_.clahe_enabled) {
         bgr = applyClaheBGR(resized, clahe_);
     } else {
-        cv::cvtColor(resized, bgr, cv::COLOR_RGB2BGR);
+        // cv::cvtColor(resized, bgr, cv::COLOR_RGB2BGR);
+        bgr = resized;  // No color conversion needed, as the input is already in BGR format
     }
 
     cv::imencode(".jpg", bgr, buf, {cv::IMWRITE_JPEG_QUALITY, cfg_.jpeg_quality});

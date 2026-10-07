@@ -20,7 +20,7 @@ find_package(tf2_ros        REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 
 # ---- OpenCV ---------------------------------------------------------------
-find_package(OpenCV REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d stereo)
 
 # ---- CUDA -----------------------------------------------------------------
 include(CheckLanguage)
@@ -221,5 +221,13 @@ install(DIRECTORY launch  DESTINATION share/${PROJECT_NAME})
 #   target_link_libraries(pipeline_queue_test Threads::Threads)
 #   add_test(NAME pipeline_queue_test COMMAND pipeline_queue_test)
 # endif()
+
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(conventional_stereo_test tests/conventional_stereo_test.cpp)
+  target_include_directories(conventional_stereo_test PRIVATE include ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(conventional_stereo_test ${OpenCV_LIBS})
+  add_test(NAME conventional_stereo_test COMMAND conventional_stereo_test)
+endif()
 
 ament_package()

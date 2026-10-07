@@ -76,6 +76,16 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("child_frame_id",      std::string("Passive/left_camera_link"));
 
     // Disparity
+    declare_parameter("disparity_backend", std::string("retinify"));
+    declare_parameter("stereo_min_disparity", 0);
+    declare_parameter("stereo_num_disparities", 128);
+    declare_parameter("stereo_block_size", 9);
+    declare_parameter("stereo_uniqueness_ratio", 10);
+    declare_parameter("stereo_speckle_window_size", 100);
+    declare_parameter("stereo_speckle_range", 2);
+    declare_parameter("stereo_disp12_max_diff", 1);
+    declare_parameter("stereo_pre_filter_cap", 31);
+    declare_parameter("stereo_texture_threshold", 10);
     declare_parameter("disparity_enabled",   true);
     declare_parameter("depth_mode",          std::string("accurate"));
     declare_parameter("max_dist",            15.0);
@@ -175,6 +185,16 @@ void PassiveStereoNode::init()
             mk("disparity/image/compressed"), best_effort_qos);
 
         DisparityWorker::Config disp_cfg;
+        disp_cfg.backend = get_parameter("disparity_backend").as_string();
+        disp_cfg.stereo.min_disparity = get_parameter("stereo_min_disparity").as_int();
+        disp_cfg.stereo.num_disparities = get_parameter("stereo_num_disparities").as_int();
+        disp_cfg.stereo.block_size = get_parameter("stereo_block_size").as_int();
+        disp_cfg.stereo.uniqueness_ratio = get_parameter("stereo_uniqueness_ratio").as_int();
+        disp_cfg.stereo.speckle_window_size = get_parameter("stereo_speckle_window_size").as_int();
+        disp_cfg.stereo.speckle_range = get_parameter("stereo_speckle_range").as_int();
+        disp_cfg.stereo.disp12_max_diff = get_parameter("stereo_disp12_max_diff").as_int();
+        disp_cfg.stereo.pre_filter_cap = get_parameter("stereo_pre_filter_cap").as_int();
+        disp_cfg.stereo.texture_threshold = get_parameter("stereo_texture_threshold").as_int();
         disp_cfg.depth_mode          = get_parameter("depth_mode").as_string();
         disp_cfg.max_dist            = get_parameter("max_dist").as_double();
         disp_cfg.sampling_factor     = get_parameter("sampling_factor").as_double();
@@ -198,7 +218,7 @@ void PassiveStereoNode::init()
 
         disp_worker_ = std::make_unique<DisparityWorker>(pub_cloud, pub_disp_img, *calib_, disp_cfg);
         disp_worker_->start();
-        RCLCPP_INFO(get_logger(), "Disparity worker started");
+        RCLCPP_INFO(get_logger(), "Disparity worker started (%s)", disp_cfg.backend.c_str());
     }
 
     // ── Preview Worker ─────────────────────────────────────────────────────────

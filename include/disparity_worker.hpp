@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <retinify/retinify.hpp>
 #include "clahe_processor.hpp"
+#include "conventional_stereo.hpp"
 #include "stereo_frame.hpp"
 #include "bounded_queue.hpp"
 #include "rate_limiter.hpp"
@@ -23,13 +24,15 @@
 namespace passive_stereo_capture
 {
 
-/// Runs the Retinify GPU stereo depth pipeline in a dedicated thread.
+/// Runs Retinify GPU or conventional OpenCV CPU stereo in a dedicated thread.
 /// Input: RGB8 stereo pair (left/right).
 /// Output: dense coloured PointCloud2 and/or compressed disparity visualizer.
 class DisparityWorker
 {
 public:
     struct Config {
+        std::string backend{"retinify"};
+        ConventionalStereo::Config stereo;
         std::string depth_mode{"accurate"};   ///< "fast" | "balanced" | "accurate"
         double max_dist{15.0};                 ///< metres; 0 = no limit
         double sampling_factor{1.0};           ///< point cloud decimation (0-1]
@@ -96,6 +99,8 @@ private:
     StereoCalib        calib_;
     cv::Ptr<cv::CLAHE> clahe_{cv::createCLAHE(cfg_.clahe_clip, cv::Size(cfg_.clahe_tiles, cfg_.clahe_tiles))};
 
+    std::unique_ptr<ConventionalStereo> conventional_;
+    cv::Mat conventional_disp_, conventional_xyz_;
     retinify::Pipeline pipeline_;
     bool               pipeline_init_{false};
     bool               rectify_{true};
