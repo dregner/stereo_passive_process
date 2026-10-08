@@ -5,7 +5,9 @@
 #include <string>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
+#ifndef PASSIVE_DISABLE_BINARY_STEREO
 #include <opencv2/stereo.hpp>
+#endif
 
 namespace passive_stereo_capture {
 
@@ -35,11 +37,15 @@ public:
             cfg.pre_filter_cap < 1 || cfg.pre_filter_cap > 63 || cfg.texture_threshold < 0)
             throw std::invalid_argument("Invalid stereo matcher parameters: disparities must be a positive multiple of 16, block size odd (BM >=5), and filters nonnegative");
         if (backend == "stereobinary") {
+#ifndef PASSIVE_DISABLE_BINARY_STEREO
             binary_matcher_ = cv::stereo::StereoBinarySGBM::create(
                 cfg.min_disparity, cfg.num_disparities, cfg.block_size,
                 100, 1000, cfg.disp12_max_diff, cfg.pre_filter_cap,
                 cfg.uniqueness_ratio, cfg.speckle_window_size, cfg.speckle_range,
                 cv::stereo::StereoBinarySGBM::MODE_SGBM);
+#else
+            throw std::invalid_argument("stereobinary requires the OpenCV contrib stereo module");
+#endif
             return;
         }
         if (backend == "stereobm") {
@@ -69,9 +75,13 @@ public:
             throw std::invalid_argument("Stereo pair must be equally sized RGB8 images larger than the disparity search and block size");
         cv::cvtColor(left_rgb, left_gray_, cv::COLOR_RGB2GRAY);
         cv::cvtColor(right_rgb, right_gray_, cv::COLOR_RGB2GRAY);
+#ifndef PASSIVE_DISABLE_BINARY_STEREO
         if (binary_matcher_) binary_matcher_->compute(left_gray_, right_gray_, fixed_);
-        else matcher_->compute(left_gray_, right_gray_, fixed_);
+        else
+#endif
+        matcher_->compute(left_gray_, right_gray_, fixed_);
         fixed_.convertTo(disparity, CV_32F, 1.0 / 16.0);
+#ifndef PASSIVE_DISABLE_BINARY_STEREO
         if (binary_matcher_) {
             // Binary matching can assign arbitrary positive disparity on constant patches.
             cv::Mat gray_float, mean, mean_square;
@@ -82,6 +92,7 @@ public:
             disparity.setTo(std::numeric_limits<float>::quiet_NaN(),
                 mean_square - mean.mul(mean) < 1.0f);
         }
+#endif
         // Invalid matches must never become plausible XYZ, even without confidence filtering.
         disparity.setTo(std::numeric_limits<float>::quiet_NaN(),
             (fixed_ <= (cfg_.min_disparity - 1) * 16) | (fixed_ <= 0));
@@ -103,7 +114,9 @@ public:
 private:
     Config cfg_;
     cv::Ptr<cv::StereoMatcher> matcher_;
+#ifndef PASSIVE_DISABLE_BINARY_STEREO
     cv::Ptr<cv::stereo::StereoBinarySGBM> binary_matcher_;
+#endif
     cv::Mat left_gray_, right_gray_, fixed_;
 };
 }

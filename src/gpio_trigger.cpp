@@ -22,7 +22,10 @@ GpioTrigger::GpioTrigger(const std::string & chip_name,
 : chip_name_(chip_name),
   line_offset_(line_offset),
   freq_hz_(freq_hz)
-{}
+{
+    if (!std::isfinite(freq_hz_) || freq_hz_ <= 0.0 || freq_hz_ > 10000.0)
+        throw std::invalid_argument("GPIO trigger frequency must be finite and in (0, 10000] Hz");
+}
 
 GpioTrigger::~GpioTrigger()
 {
@@ -32,8 +35,13 @@ GpioTrigger::~GpioTrigger()
 void GpioTrigger::start()
 {
     if (running_.load()) return;
+    if (thread_.joinable()) thread_.join();
     running_.store(true);
-    thread_ = std::thread(&GpioTrigger::run, this);
+    thread_ = std::thread([this] {
+        try { run(); }
+        catch (const std::exception & e) { std::cerr << e.what() << "\n"; }
+        running_.store(false);
+    });
 }
 
 void GpioTrigger::stop()
@@ -82,11 +90,19 @@ void GpioTrigger::run()
     const long low_us      = period_us - high_us;
     using us = std::chrono::microseconds;
 
+    // Absolute deadlines prevent scheduler delay from accumulating each cycle.
+    // This is software timed GPIO, not the hardware PWM peripheral.
+    auto next = std::chrono::steady_clock::now();
     while (running_.load()) {
-        gpiod_line_set_value(line, 1);
-        std::this_thread::sleep_for(us(high_us));
-        gpiod_line_set_value(line, 0);
-        std::this_thread::sleep_for(us(low_us));
+        if (gpiod_line_set_value(line, 1) < 0) break;
+        next += us(high_us);
+        std::this_thread::sleep_until(next);
+        if (gpiod_line_set_value(line, 0) < 0) break;
+        next += us(low_us);
+        const auto now = std::chrono::steady_clock::now();
+        // Skip missed cycles instead of emitting rapid catch-up pulses.
+        if (now > next) next += us(((now - next) / us(period_us) + 1) * period_us);
+        std::this_thread::sleep_until(next);
     }
 
     // Ensure line is low when stopped

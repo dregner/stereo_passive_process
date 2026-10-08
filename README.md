@@ -405,7 +405,7 @@ Set `disparity_backend: "stereosgbm"` (OpenCV SGBM 3-way) or
 `disparity_backend: "stereobm"`, or `disparity_backend: "stereobinary"`
 (OpenCV contrib StereoBinarySGBM) in your parameter YAML. The default remains
 `"retinify"`. All CPU backends publish through the existing disparity JPEG and
-XYZRGB point-cloud topics, using the same publication rates, crop, sampling,
+optionally enabled XYZRGB point-cloud topics, using the same publication rates, crop, sampling,
 distance limit, and optional local smoothness confidence filter.
 
 CPU matching rectifies the RGB pair using the stereo calibration, resizes to
@@ -494,3 +494,41 @@ Initial settings use `exposure_time`, `gain`, `gain_auto`, and `balance_white_au
 from the YAML. Optional additions are `exposure_auto`, `gain_mode`, and
 `white_balance_mode` (`Off`, `Once`, or `Continuous`), plus `balance_ratio_red`
 and `balance_ratio_blue` (default 1.5).
+
+
+### Disparity output and rectification
+
+`disp_publish_cloud: false` (default) publishes only the colored disparity JPEG
+on `/Passive/disparity/image/compressed`. No raw disparity topic is published.
+Enable `disp_publish_cloud` explicitly to restore the dense point cloud.
+Cloud-only XYZ, point packing, and rectified color buffers are omitted when disabled.
+
+OpenCV BM/SGBM/Binary matching always receives CPU-rectified images. Retinify
+receives raw images plus K/D/R/T and performs its own rectification by default.
+Set `disparity_rectify_on_cpu: true` to rectify before Retinify; that path supplies
+rectified P intrinsics, zero distortion, identity rotation, and rectified baseline.
+Resized principal points use `(c + 0.5) * scale - 0.5`, matching pixel-center
+coordinates; scale=1 leaves calibration unchanged. This applies to image resizing,
+not an arbitrary calibration offset or a replacement for sensor binning calibration.
+
+`trigger_source` selects the camera input line (default `Line3`). For the supplied
+camera manual, Line2 is connector pin 3; pin 2 is Line0. Confirm physical wiring
+before enabling trigger mode. Jetson chip offsets must be verified with `gpioinfo`.
+The libgpiod trigger is software timed, with absolute deadlines to prevent drift;
+it is not hardware PWM and scheduler jitter remains possible.
+
+
+Generate matched native-resolution SLAM settings rather than reusing a differently
+scaled camera file:
+
+```bash
+python3 tools/make_slam_settings.py --calibration config/stereo_calibration_bfs.yaml \
+  --template config/20261006_orbslam3_pinhole.yaml --output /tmp/slam.yaml
+```
+
+Use `slam_scale_factor: 1.0` with this output. ORB-SLAM3 PinHole rectifies internally.
+Its `Stereo.T_c1_c2` is the inverse of OpenCV calibration R/T. The generator sets
+this direction and retains translation in metres. OpenCV contrib `stereo` is now
+optional at build time; without it `stereobinary` reports an explicit error, while
+BM/SGBM and Retinify remain available. Build against the same OpenCV version as
+ORB-SLAM3 to avoid loading conflicting versions in one process.

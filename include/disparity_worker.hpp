@@ -48,6 +48,9 @@ public:
         int width{0};                         ///< 0/0 = native; positive pair = software resize
         int height{0};
         double cloud_hz{15.0};      ///< Max frequency to publish pointcloud
+        double process_hz{0.0};    ///< 0 = every available pair; positive = bound inference work
+        bool rectify_on_cpu{false}; ///< Retinify: optional OpenCV rectification before inference
+        std::string trace_path;   ///< Optional per-frame CSV profiling
         double image_hz{10.0};     ///< Max frequency to publish disparity visualization
     };
 
@@ -103,7 +106,6 @@ private:
     cv::Mat conventional_disp_, conventional_xyz_;
     retinify::Pipeline pipeline_;
     bool               pipeline_init_{false};
-    bool               rectify_{true};
     uint32_t           pipeline_W_{0};  // cached pipeline width — detect resolution changes
     uint32_t           pipeline_H_{0};
 
@@ -123,7 +125,7 @@ private:
 
     // Disparity image preview buffer
     std::vector<uchar> disp_jpeg_buf_;
-    RateLimiter cloud_limiter_, image_limiter_;
+    RateLimiter cloud_limiter_, image_limiter_, process_limiter_;
 
     BoundedQueue<StereoFramePtr> queue_{1, /*drop_oldest=*/true};
     WorkerMetrics metrics_;

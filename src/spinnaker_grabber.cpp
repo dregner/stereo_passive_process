@@ -213,10 +213,11 @@ void SpinnakerGrabber::configureCamera(CameraPtr cam, bool is_left)
 
     // ── Trigger ───────────────────────────────────────────────────────────────
     if (cfg_.trigger_mode) {
-        setEnum(cam, "LineSelector",  "Line3");
+        setEnum(cam, "TriggerMode", "Off");
+        setEnum(cam, "LineSelector", cfg_.trigger_source);
         setEnum(cam, "LineMode",      "Input");
         setEnum(cam, "TriggerSelector", "FrameStart");
-        setEnum(cam, "TriggerSource",   "Line3");
+        setEnum(cam, "TriggerSource", cfg_.trigger_source);
         setEnum(cam, "TriggerOverlap",  "ReadOut");
         setFloat(cam, "TriggerDelay",   static_cast<double>(cfg_.trigger_delay_us));
         setEnum(cam, "TriggerMode",     "On");
@@ -234,7 +235,7 @@ void SpinnakerGrabber::configureCamera(CameraPtr cam, bool is_left)
 
     std::cout << "[SpinnakerGrabber] Camera (" << (is_left ? "Left" : "Right")
               << " " << (is_left ? cfg_.serial_left : cfg_.serial_right)
-              << ") configured: " << (cfg_.trigger_mode ? "HW Trigger (Line3)" : "Continuous")
+              << ") configured: " << (cfg_.trigger_mode ? "HW Trigger (" + cfg_.trigger_source + ")" : "Continuous")
               << ", FPS target=" << cfg_.frame_rate
               << ", Exp=" << exp_us << " us\n";
 }

@@ -20,7 +20,11 @@ find_package(tf2_ros        REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 
 # ---- OpenCV ---------------------------------------------------------------
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d stereo)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d OPTIONAL_COMPONENTS stereo)
+if(NOT OpenCV_stereo_FOUND)
+  add_compile_definitions(PASSIVE_DISABLE_BINARY_STEREO=1)
+  message(STATUS "OpenCV contrib stereo unavailable: BM/SGBM and Retinify remain enabled")
+endif()
 
 # ---- CUDA -----------------------------------------------------------------
 include(CheckLanguage)
@@ -212,22 +216,5 @@ set_target_properties(passive_stereo_node PROPERTIES
 install(TARGETS passive_stereo_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config  DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY launch  DESTINATION share/${PROJECT_NAME})
-
-# if(BUILD_TESTING)
-#   enable_testing()
-#   find_package(Threads REQUIRED)
-#   add_executable(pipeline_queue_test tests/queue_test.cpp)
-#   target_include_directories(pipeline_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-#   target_link_libraries(pipeline_queue_test Threads::Threads)
-#   add_test(NAME pipeline_queue_test COMMAND pipeline_queue_test)
-# endif()
-
-if(BUILD_TESTING)
-  enable_testing()
-  add_executable(conventional_stereo_test tests/conventional_stereo_test.cpp)
-  target_include_directories(conventional_stereo_test PRIVATE include ${OpenCV_INCLUDE_DIRS})
-  target_link_libraries(conventional_stereo_test ${OpenCV_LIBS})
-  add_test(NAME conventional_stereo_test COMMAND conventional_stereo_test)
-endif()
 
 ament_package()

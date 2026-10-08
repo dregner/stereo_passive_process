@@ -1,6 +1,7 @@
 #include "passive_stereo_node.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <stdexcept>
 #include <iomanip>
 #include <sstream>
@@ -47,6 +48,7 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("binning",            1);
     declare_parameter("trigger_mode",       false);
     declare_parameter("trigger_delay_us",   29);
+    declare_parameter("trigger_source", std::string("Line3"));
     declare_parameter("max_consec_errors",  10);
     declare_parameter("sync_tolerance_ms",  0.0);
 
@@ -87,6 +89,7 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("stereo_pre_filter_cap", 31);
     declare_parameter("stereo_texture_threshold", 10);
     declare_parameter("disparity_enabled",   true);
+    declare_parameter("disp_publish_cloud", false);
     declare_parameter("depth_mode",          std::string("accurate"));
     declare_parameter("max_dist",            15.0);
     declare_parameter("sampling_factor",     1.0);
@@ -96,6 +99,10 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("confidence_alpha",    2.0);
     declare_parameter("publish_confidence",  true);
     declare_parameter("disp_frame_id",       std::string("Passive/left_camera_link"));
+    declare_parameter("depth_process_hz", 0.0);
+    declare_parameter("disparity_rectify_on_cpu", false);
+    declare_parameter("disparity_trace_path", std::string(""));
+    declare_parameter("opencv_threads", 0);
     declare_parameter("disp_cloud_hz",       15.0);
     declare_parameter("depth_width",         0);
     declare_parameter("depth_height",        0);
@@ -113,6 +120,8 @@ void PassiveStereoNode::declareParameters()
 
 void PassiveStereoNode::init()
 {
+    const int cv_threads = get_parameter("opencv_threads").as_int();
+    if (cv_threads > 0) cv::setNumThreads(cv_threads);
     const std::string ns = get_parameter("namespace").as_string();
     auto mk = [&](const std::string & topic) -> std::string {
         return "/" + ns + "/" + topic;
@@ -179,8 +188,10 @@ void PassiveStereoNode::init()
 
     // ── Disparity Worker ───────────────────────────────────────────────────────
     if (disp_enabled_) {
-        auto pub_cloud = create_publisher<sensor_msgs::msg::PointCloud2>(
-            mk("disparity/pointcloud"), sensor_qos);
+        DisparityWorker::PointCloud2Pub pub_cloud;
+        if (get_parameter("disp_publish_cloud").as_bool())
+            pub_cloud = create_publisher<sensor_msgs::msg::PointCloud2>(
+                mk("disparity/pointcloud"), sensor_qos);
         auto pub_disp_img = create_publisher<sensor_msgs::msg::CompressedImage>(
             mk("disparity/image/compressed"), best_effort_qos);
 
@@ -213,6 +224,11 @@ void PassiveStereoNode::init()
             ((disp_cfg.width == 0) != (disp_cfg.height == 0))) {
             throw std::invalid_argument("depth_width/depth_height must both be zero or both positive");
         }
+        disp_cfg.process_hz = get_parameter("depth_process_hz").as_double();
+        disp_cfg.rectify_on_cpu = get_parameter("disparity_rectify_on_cpu").as_bool();
+        disp_cfg.trace_path = get_parameter("disparity_trace_path").as_string();
+        if (!std::isfinite(disp_cfg.process_hz) || disp_cfg.process_hz < 0)
+            throw std::invalid_argument("Depth processing rate must be finite and nonnegative");
         disp_cfg.cloud_hz            = get_parameter("disp_cloud_hz").as_double();
         disp_cfg.image_hz            = get_parameter("disp_image_hz").as_double();
 
@@ -257,6 +273,7 @@ void PassiveStereoNode::init()
     cam_cfg.gain_auto              = get_parameter("gain_auto").as_bool();
     cam_cfg.balance_white_auto     = get_parameter("balance_white_auto").as_bool();
     cam_cfg.trigger_mode           = trigger_enabled_;
+    cam_cfg.trigger_source = get_parameter("trigger_source").as_string();
     cam_cfg.trigger_delay_us       = get_parameter("trigger_delay_us").as_int();
     cam_cfg.binning                = get_parameter("binning").as_int();
     cam_cfg.max_consecutive_errors = get_parameter("max_consec_errors").as_int();
@@ -295,6 +312,11 @@ void PassiveStereoNode::init()
 void PassiveStereoNode::reportTimerCallback()
 {
     if (!grabber_) return;
+    if (trigger_enabled_ && gpio_trigger_ && !gpio_trigger_->isRunning()) {
+        RCLCPP_ERROR(get_logger(), "GPIO trigger failed; stopping acquisition instead of waiting for missing pulses");
+        rclcpp::shutdown();
+        return;
+    }
     auto s = grabber_->stats();
 
     std::stringstream ss;

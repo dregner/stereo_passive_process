@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <fstream>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -72,29 +73,33 @@ bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
                   << sx << ", " << sy << ") to match frame size " << W << "x" << H << std::endl;
     }
     else std::cout << "[DisparityWorker] No scaling factor: " << sx << ", " << sy << std::endl;
-    if(!rectify_){
-        calib.leftIntrinsics.fx  = calib_.fx_l() * sx;
-        calib.leftIntrinsics.fy  = calib_.fy_l() * sy;
-        calib.leftIntrinsics.cx  = calib_.cx_l() * sx;
-        calib.leftIntrinsics.cy  = calib_.cy_l() * sy;
-        calib.rightIntrinsics.fx = calib_.fx_r() * sx;
-        calib.rightIntrinsics.fy = calib_.fy_r() * sy;
-        calib.rightIntrinsics.cx = calib_.cx_r() * sx;
-        calib.rightIntrinsics.cy = calib_.cy_r() * sy;
-        calib.leftDistortion     = calib_.toRetinifyDistortion(calib_.leftDistortions());
-        calib.rightDistortion    = calib_.toRetinifyDistortion(calib_.rightDistortions());
-        calib.rotation           = calib_.rot();
-        calib.translation        = calib_.trans();
-    }
-    else{
-        cv::Mat P2 = calib_.P2();
-        calib.leftIntrinsics.fx  = P2.at<double>(0,0) * sx;
-        calib.leftIntrinsics.fy  = P2.at<double>(1,1) * sy;
-        calib.leftIntrinsics.cx  = P2.at<double>(0,2) * sx;
-        calib.leftIntrinsics.cy  = P2.at<double>(1,2) * sy;
-        calib.rightIntrinsics = calib.leftIntrinsics;
-        calib.rotation           = retinify::Identity();
-        calib.translation        = {-calib_.baseline(), 0, 0};
+    // Retinify owns rectification: give it RAW images and RAW calibration.
+    // Never combine raw pixels with rectified P matrices / identity extrinsics.
+    calib.leftIntrinsics.fx  = calib_.fx_l() * sx;
+    calib.leftIntrinsics.fy  = calib_.fy_l() * sy;
+    calib.leftIntrinsics.cx  = (calib_.cx_l() + 0.5) * sx - 0.5;
+    calib.leftIntrinsics.cy  = (calib_.cy_l() + 0.5) * sy - 0.5;
+    calib.rightIntrinsics.fx = calib_.fx_r() * sx;
+    calib.rightIntrinsics.fy = calib_.fy_r() * sy;
+    calib.rightIntrinsics.cx = (calib_.cx_r() + 0.5) * sx - 0.5;
+    calib.rightIntrinsics.cy = (calib_.cy_r() + 0.5) * sy - 0.5;
+    calib.leftDistortion = calib_.toRetinifyDistortion(calib_.leftDistortions());
+    calib.rightDistortion = calib_.toRetinifyDistortion(calib_.rightDistortions());
+    calib.rotation = calib_.rot();
+    calib.translation = calib_.trans();
+
+    if (cfg_.rectify_on_cpu) {
+        // Inputs were already rectified by OpenCV. Preserve those intrinsics;
+        // zero distortion and identity rotation prevent a second geometric warp.
+        const auto & P1 = calib_.P1();
+        const auto & P2 = calib_.P2();
+        calib.leftIntrinsics = {P1.at<double>(0,0)*sx, P1.at<double>(1,1)*sy,
+            (P1.at<double>(0,2)+0.5)*sx-0.5, (P1.at<double>(1,2)+0.5)*sy-0.5};
+        calib.rightIntrinsics = {P2.at<double>(0,0)*sx, P2.at<double>(1,1)*sy,
+            (P2.at<double>(0,2)+0.5)*sx-0.5, (P2.at<double>(1,2)+0.5)*sy-0.5};
+        calib.leftDistortion = {}; calib.rightDistortion = {};
+        calib.rotation = retinify::Identity();
+        calib.translation = {P2.at<double>(0,3)/P2.at<double>(0,0), 0, 0};
     }
 
     auto status = pipeline_.Initialize(W, H, retinify::PixelFormat::RGB8, mode, calib);
@@ -116,38 +121,41 @@ bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
         }
     }
 
-    // ── XYZ pinned buffer ─────────────────────────────────────────────────────
-    size_t xyz_bytes = static_cast<size_t>(W) * H * 3 * sizeof(float);
-    if (pinned_xyz_bytes_ < xyz_bytes) {
-        if (h_pinned_xyz_) { cudaFreeHost(h_pinned_xyz_); h_pinned_xyz_ = nullptr; }
-        if (cudaHostAlloc(&h_pinned_xyz_, xyz_bytes, cudaHostAllocDefault) != cudaSuccess) {
-            h_pinned_xyz_ = nullptr;
-            return false;
+    if (pub_cloud_) {
+        // ── XYZ pinned buffer ─────────────────────────────────────────────────────
+        size_t xyz_bytes = static_cast<size_t>(W) * H * 3 * sizeof(float);
+        if (pinned_xyz_bytes_ < xyz_bytes) {
+            if (h_pinned_xyz_) { cudaFreeHost(h_pinned_xyz_); h_pinned_xyz_ = nullptr; }
+            if (cudaHostAlloc(&h_pinned_xyz_, xyz_bytes, cudaHostAllocDefault) != cudaSuccess) {
+                h_pinned_xyz_ = nullptr;
+                return false;
+            }
+            pinned_xyz_bytes_ = xyz_bytes;
         }
-        pinned_xyz_bytes_ = xyz_bytes;
-    }
 
-    size_t pt_size = cfg_.publish_confidence ?
-        sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
-    size_t max_pts = static_cast<size_t>(W) * H;
-    cpu_point_buf_.resize(max_pts * pt_size);
+        size_t pt_size = cfg_.publish_confidence ?
+            sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
+        size_t max_pts = static_cast<size_t>(W) * H;
+        cpu_point_buf_.resize(max_pts * pt_size);
 
-    // ── Rectified Left RGB pinned buffer ──────────────────────────────────────
-    size_t rect_left_bytes = static_cast<size_t>(W) * H * 3 * sizeof(uint8_t);
-    if (pinned_rect_left_bytes_ < rect_left_bytes) {
-        if (h_pinned_rect_left_) { cudaFreeHost(h_pinned_rect_left_); h_pinned_rect_left_ = nullptr; }
-        if (cudaHostAlloc(&h_pinned_rect_left_, rect_left_bytes, cudaHostAllocDefault) == cudaSuccess) {
-            pinned_rect_left_bytes_ = rect_left_bytes;
+        // ── Rectified Left RGB pinned buffer ──────────────────────────────────────
+        size_t rect_left_bytes = static_cast<size_t>(W) * H * 3 * sizeof(uint8_t);
+        if (pinned_rect_left_bytes_ < rect_left_bytes) {
+            if (h_pinned_rect_left_) { cudaFreeHost(h_pinned_rect_left_); h_pinned_rect_left_ = nullptr; }
+            if (cudaHostAlloc(&h_pinned_rect_left_, rect_left_bytes, cudaHostAllocDefault) == cudaSuccess) {
+                pinned_rect_left_bytes_ = rect_left_bytes;
+                rect_left_rgb_ = cv::Mat(static_cast<int>(H), static_cast<int>(W), CV_8UC3, h_pinned_rect_left_);
+            } else {
+                h_pinned_rect_left_ = nullptr;
+                rect_left_rgb_.create(static_cast<int>(H), static_cast<int>(W), CV_8UC3);
+            }
+        }
+
+        if (h_pinned_rect_left_) {
             rect_left_rgb_ = cv::Mat(static_cast<int>(H), static_cast<int>(W), CV_8UC3, h_pinned_rect_left_);
-        } else {
-            h_pinned_rect_left_ = nullptr;
-            rect_left_rgb_.create(static_cast<int>(H), static_cast<int>(W), CV_8UC3);
         }
-    }
 
-    if (h_pinned_rect_left_) {
-        rect_left_rgb_ = cv::Mat(static_cast<int>(H), static_cast<int>(W), CV_8UC3, h_pinned_rect_left_);
-    }
+    } // Cloud-only buffers are unnecessary for compressed disparity output.
 
     pipeline_W_ = W;
     pipeline_H_ = H;
@@ -200,7 +208,7 @@ size_t DisparityWorker::compactCloud(
                 }
             }
 
-            uint8_t r = img_row[u*3+2], g = img_row[u*3+1], b = img_row[u*3+0];
+            uint8_t r = img_row[u*3+2], g = img_row[u*3+1], b = img_row[u*3+0]; // BGR format
             uint32_t rgb = (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
 
             if (with_conf) {
@@ -218,12 +226,23 @@ size_t DisparityWorker::compactCloud(
 
 void DisparityWorker::run()
 {
+    std::ofstream trace;
+    if (!cfg_.trace_path.empty()) {
+        trace.open(cfg_.trace_path);
+        if (!trace) std::cerr << "Cannot open disparity trace file; profiling disabled\n";
+        trace << "frame_id,stamp_ns,queue_ms,prepare_ms,execute_ms,output_ms,total_ms,points\n";
+    }
     while (running_.load()) {
         StereoFramePtr frame;
         if (!queue_.pop(frame)) continue;
+        // No output consumer: avoid rectification, inference and image enhancement.
+        // Capture and SLAM continue independently at their configured rates.
+        if ((!pub_cloud_ || pub_cloud_->get_subscription_count() == 0) &&
+            (!pub_disp_img_ || pub_disp_img_->get_subscription_count() == 0)) continue;
+        if (cfg_.process_hz > 0.0 && !process_limiter_.ready(frame->stamp.seconds(), cfg_.process_hz)) continue;
         const auto processing_start = std::chrono::steady_clock::now();
         cv::Mat input_left, input_right;
-        if (conventional_) {
+        if (conventional_ || cfg_.rectify_on_cpu) {
             // Rectification maps use calibration dimensions, including with camera binning.
             cv::Mat native_left = frame->left_rgb, native_right = frame->right_rgb;
             const cv::Size native_size(calib_.width(), calib_.height());
@@ -232,10 +251,9 @@ void DisparityWorker::run()
                 cv::resize(frame->right_rgb, native_right, native_size);
             }
             calib_.rectify(native_left, native_right, input_left, input_right);
-        } else if(rectify_){
-            input_left = frame->left_rgb, input_right = frame->right_rgb;
-        }else{
-            calib_.rectify(frame->left_rgb, frame->right_rgb, input_left, input_right);
+        } else {
+            input_left = frame->left_rgb;
+            input_right = frame->right_rgb;
         }
         if (cfg_.width > 0 && cfg_.height > 0 &&
             (input_left.cols != cfg_.width || input_left.rows != cfg_.height)) {
@@ -264,6 +282,7 @@ void DisparityWorker::run()
             right_rgb = input_right;
         }
 
+        const auto prepared = std::chrono::steady_clock::now();
         if (conventional_) {
             try {
                 conventional_->compute(left_rgb, right_rgb, conventional_disp_);
@@ -278,6 +297,8 @@ void DisparityWorker::run()
             if (!status.IsOK()) continue;
         }
 
+        const auto executed = std::chrono::steady_clock::now();
+        size_t cloud_points = 0;
         processed_frames_++;
         metrics_.record(processing_start, frame->received_at);
 
@@ -310,7 +331,7 @@ void DisparityWorker::run()
             } else {
                 auto col_status = retinify::ColorizeDisparity(disp_ptr, W*sizeof(float), disp_colored.ptr<uint8_t>(), disp_colored.step[0], W, H, 256.0f);
                 colorized = col_status.IsOK();
-                // if (colorized) cv::cvtColor(disp_colored, disp_colored, cv::COLOR_RGB2BGR);
+                if (colorized) cv::cvtColor(disp_colored, disp_colored, cv::COLOR_RGB2BGR);
             }
             if (colorized) {
                 cv::imencode(".jpg", disp_colored, disp_jpeg_buf_, {cv::IMWRITE_JPEG_QUALITY, 20});
@@ -345,7 +366,7 @@ void DisparityWorker::run()
             }
             uint8_t * color_ptr;
             std::size_t color_stride;
-            if(!conventional_ && rectify_){
+            if(!conventional_){
                 color_ptr = rect_left_rgb_.ptr<uint8_t>();
                 color_stride = rect_left_rgb_.step[0];
                 auto rect_status = pipeline_.RetrieveRectifiedLeftImage(color_ptr, color_stride);
@@ -378,6 +399,7 @@ void DisparityWorker::run()
                 static_cast<float>(cfg_.confidence_alpha),
                 static_cast<float>(cfg_.min_confidence));
 
+            cloud_points = valid;
             if (valid > 0) {
                 uint32_t pt_step = wconf ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
                 size_t   data_sz = valid * pt_step;
@@ -416,6 +438,14 @@ void DisparityWorker::run()
             } else {
                 empty_clouds_++;
             }
+        }
+        if (trace) {
+            const auto finish = std::chrono::steady_clock::now();
+            const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b-a).count(); };
+            trace << frame->frame_id << ',' << frame->stamp.nanoseconds() << ','
+                  << ms(frame->received_at, processing_start) << ','
+                  << ms(processing_start, prepared) << ',' << ms(prepared, executed) << ','
+                  << ms(executed, finish) << ',' << ms(processing_start, finish) << ',' << cloud_points << '\n';
         }
         metrics_.record(processing_start, frame->received_at);
     }

@@ -8,9 +8,9 @@
 namespace passive_stereo_capture
 {
 
-/// Generates a hardware PWM trigger signal on a Jetson GPIO line using libgpiod.
+/// Generates a software timed GPIO trigger signal on a Jetson GPIO line using libgpiod.
 /// The signal is a 50% duty-cycle square wave at the specified frequency.
-/// This triggers both BFS cameras simultaneously via their hardware trigger input (Line3).
+/// This triggers both BFS cameras simultaneously via their configured hardware trigger input.
 class GpioTrigger
 {
 public:
