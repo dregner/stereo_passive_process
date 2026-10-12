@@ -9,6 +9,7 @@
 #include <opencv2/imgproc.hpp>
 #include "cuda_color_converter.hpp"
 #include "color_correction.hpp"
+#include "spinnaker_color_correction.hpp"
 
 namespace passive_stereo_capture
 {
@@ -48,6 +49,7 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("gain_auto",          false);
     declare_parameter("balance_white_auto", true);
     declare_parameter("color_correction_enabled", false);
+    declare_parameter("color_correction_backend", std::string("spinnaker"));
     declare_parameter("color_ccm_left", std::vector<double>{1,0,0,0,1,0,0,0,1});
     declare_parameter("color_ccm_right", std::vector<double>{1,0,0,0,1,0,0,0,1});
     declare_parameter("binning",            1);
@@ -135,9 +137,12 @@ void PassiveStereoNode::init()
 {
     color_correction_enabled_ = get_parameter("color_correction_enabled").as_bool();
     if (color_correction_enabled_) {
+        const auto backend = get_parameter("color_correction_backend").as_string();
+        if (backend != "spinnaker" && backend != "opencv")
+            throw std::invalid_argument("color_correction_backend must be spinnaker or opencv");
         color_ccm_left_ = colorCorrectionMatrix(get_parameter("color_ccm_left").as_double_array());
         color_ccm_right_ = colorCorrectionMatrix(get_parameter("color_ccm_right").as_double_array());
-        RCLCPP_INFO(get_logger(), "Host RGB color correction enabled (separate left/right CCMs)");
+        RCLCPP_INFO(get_logger(), "Host RGB color correction enabled: %s (separate left/right CCMs)", backend.c_str());
     }
 
     const auto trigger_generator = get_parameter("trigger_generator").as_string();
@@ -407,6 +412,19 @@ void PassiveStereoNode::preprocessThread()
     // raw Bayer frames first and never waits for GPU color conversion.
     CudaColorConverter cuda_color;
     const bool use_cuda = get_parameter("color_conversion_backend").as_string() == "cuda";
+    const bool sdk_ccm = color_correction_enabled_ &&
+        get_parameter("color_correction_backend").as_string() == "spinnaker";
+    Spinnaker::CCMSettings left_settings, right_settings;
+    try {
+        if (sdk_ccm) {
+            left_settings = spinnakerCcmSettings(get_parameter("color_ccm_left").as_double_array());
+            right_settings = spinnakerCcmSettings(get_parameter("color_ccm_right").as_double_array());
+        }
+    } catch (const std::exception & e) {
+        RCLCPP_ERROR(get_logger(), "Spinnaker CCM initialization failed: %s", e.what());
+        rclcpp::shutdown();
+        return;
+    }
     while (preprocess_running_.load()) {
         StereoFramePtr raw_frame;
         if (!preprocess_queue_.pop(raw_frame)) continue;
@@ -425,8 +443,19 @@ void PassiveStereoNode::preprocessThread()
             cv::cvtColor(raw_frame->right_raw, color_frame->right_rgb, cv::COLOR_BayerRG2RGB);
         }
         if (color_correction_enabled_) {
-            correctRgb(color_frame->left_rgb, color_ccm_left_);
-            correctRgb(color_frame->right_rgb, color_ccm_right_);
+            try {
+                if (sdk_ccm) {
+                    correctRgbSpinnaker(color_frame->left_rgb, left_settings);
+                    correctRgbSpinnaker(color_frame->right_rgb, right_settings);
+                } else {
+                    correctRgb(color_frame->left_rgb, color_ccm_left_);
+                    correctRgb(color_frame->right_rgb, color_ccm_right_);
+                }
+            } catch (const std::exception & e) {
+                RCLCPP_ERROR(get_logger(), "Color correction failed: %s", e.what());
+                rclcpp::shutdown();
+                return;
+            }
         }
         if (disp_worker_) disp_worker_->push(color_frame);
         if (prev_worker_) prev_worker_->push(color_frame);
