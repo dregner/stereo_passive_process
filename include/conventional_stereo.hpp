@@ -3,10 +3,16 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <memory>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 #ifndef PASSIVE_DISABLE_BINARY_STEREO
 #include <opencv2/stereo.hpp>
+#endif
+#ifdef PASSIVE_HAVE_OPENCV_CUDA
+#include <opencv2/core/cuda.hpp>
+#include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudastereo.hpp>
 #endif
 
 namespace passive_stereo_capture {
@@ -24,10 +30,12 @@ public:
         int disp12_max_diff{1};
         int pre_filter_cap{31};
         int texture_threshold{10}; // BM only
+        int cuda_p1{10};
+        int cuda_p2{120};
     };
 
     ConventionalStereo(const std::string & backend, const Config & cfg) : cfg_(cfg) {
-        if (backend != "stereobm" && backend != "stereosgbm" && backend != "stereobinary")
+        if (backend != "stereobm" && backend != "stereosgbm" && backend != "stereobinary" && backend != "cuda_sgm")
             throw std::invalid_argument("Unknown conventional stereo backend");
         if (cfg.num_disparities <= 0 || cfg.num_disparities % 16 != 0 ||
             cfg.min_disparity < 0 || cfg.min_disparity + static_cast<long long>(cfg.num_disparities) > 2047 ||
@@ -36,6 +44,19 @@ public:
             cfg.speckle_window_size < 0 || cfg.speckle_range < 0 ||
             cfg.pre_filter_cap < 1 || cfg.pre_filter_cap > 63 || cfg.texture_threshold < 0)
             throw std::invalid_argument("Invalid stereo matcher parameters: disparities must be a positive multiple of 16, block size odd (BM >=5), and filters nonnegative");
+        if (backend == "cuda_sgm") {
+            if ((cfg.num_disparities != 64 && cfg.num_disparities != 128 && cfg.num_disparities != 256) ||
+                cfg.cuda_p1 < 0 || cfg.cuda_p2 <= cfg.cuda_p1)
+                throw std::invalid_argument("CUDA SGM needs 64, 128 or 256 disparities and 0 <= P1 < P2");
+#ifdef PASSIVE_HAVE_OPENCV_CUDA
+            ensureCudaStream();
+            cuda_matcher_ = cv::cuda::createStereoSGM(cfg.min_disparity, cfg.num_disparities,
+                cfg.cuda_p1, cfg.cuda_p2, cfg.uniqueness_ratio, cv::cuda::StereoSGM::MODE_HH4);
+            return;
+#else
+            throw std::invalid_argument("cuda_sgm requires OpenCV CUDA stereo/imgproc modules");
+#endif
+        }
         if (backend == "stereobinary") {
 #ifndef PASSIVE_DISABLE_BINARY_STEREO
             binary_matcher_ = cv::stereo::StereoBinarySGBM::create(
@@ -73,6 +94,22 @@ public:
             left_rgb.cols <= cfg_.min_disparity + cfg_.num_disparities + cfg_.block_size ||
             left_rgb.rows <= cfg_.block_size)
             throw std::invalid_argument("Stereo pair must be equally sized RGB8 images larger than the disparity search and block size");
+#ifdef PASSIVE_HAVE_OPENCV_CUDA
+        if (cuda_matcher_) {
+            cuda_left_.upload(left_rgb, *cuda_stream_);
+            cuda_right_.upload(right_rgb, *cuda_stream_);
+            cv::cuda::cvtColor(cuda_left_, cuda_left_gray_, cv::COLOR_RGB2GRAY, 0, *cuda_stream_);
+            cv::cuda::cvtColor(cuda_right_, cuda_right_gray_, cv::COLOR_RGB2GRAY, 0, *cuda_stream_);
+            cuda_matcher_->compute(cuda_left_gray_, cuda_right_gray_, cuda_fixed_, *cuda_stream_);
+            // SGM produces CV_16S with four fractional bits. Reprojection expects pixels.
+            cuda_fixed_.convertTo(cuda_pixels_, CV_32F, 1.0 / 16.0, 0.0, *cuda_stream_);
+            cuda_pixels_.download(disparity, *cuda_stream_);
+            cuda_stream_->waitForCompletion();
+            disparity.setTo(std::numeric_limits<float>::quiet_NaN(),
+                (disparity <= cfg_.min_disparity - 1) | (disparity <= 0));
+            return;
+        }
+#endif
         cv::cvtColor(left_rgb, left_gray_, cv::COLOR_RGB2GRAY);
         cv::cvtColor(right_rgb, right_gray_, cv::COLOR_RGB2GRAY);
 #ifndef PASSIVE_DISABLE_BINARY_STEREO
@@ -98,6 +135,35 @@ public:
             (fixed_ <= (cfg_.min_disparity - 1) * 16) | (fixed_ <= 0));
     }
 
+    bool isCuda() const {
+#ifdef PASSIVE_HAVE_OPENCV_CUDA
+        return !cuda_matcher_.empty();
+#else
+        return false;
+#endif
+    }
+
+    // CUDA matching retains its float pixel disparity on-device. CPU matching can
+    // optionally upload disparity for GPU reprojection; cloud packing remains CPU.
+    void reproject(const cv::Mat & disparity, cv::Mat & xyz, const cv::Mat & q, bool use_cuda) {
+        if (!use_cuda) {
+            cv::reprojectImageTo3D(disparity, xyz, q, false, CV_32F);
+            return;
+        }
+#ifdef PASSIVE_HAVE_OPENCV_CUDA
+        ensureCudaStream();
+        if (!cuda_matcher_) cuda_pixels_.upload(disparity, *cuda_stream_);
+        cv::Mat float_q;
+        q.convertTo(float_q, CV_32F);
+        cv::cuda::reprojectImageTo3D(cuda_pixels_, cuda_xyz_, float_q, 3, *cuda_stream_);
+        cuda_xyz_.download(xyz, *cuda_stream_);
+        cuda_stream_->waitForCompletion();
+        xyz.setTo(cv::Scalar::all(std::numeric_limits<float>::quiet_NaN()), disparity != disparity);
+#else
+        throw std::invalid_argument("GPU reprojection requires the OpenCV CUDA stereo module");
+#endif
+    }
+
     static cv::Mat scaledQ(const cv::Mat & native_q, cv::Size native, cv::Size output) {
         const double sx = static_cast<double>(output.width) / native.width;
         const double sy = static_cast<double>(output.height) / native.height;
@@ -118,5 +184,17 @@ private:
     cv::Ptr<cv::stereo::StereoBinarySGBM> binary_matcher_;
 #endif
     cv::Mat left_gray_, right_gray_, fixed_;
+#ifdef PASSIVE_HAVE_OPENCV_CUDA
+    void ensureCudaStream() {
+        if (cuda_stream_) return;
+        if (cv::cuda::getCudaEnabledDeviceCount() <= 0)
+            throw std::invalid_argument("OpenCV CUDA processing requested but no CUDA device is available");
+        cuda_stream_ = std::make_unique<cv::cuda::Stream>();
+    }
+    std::unique_ptr<cv::cuda::Stream> cuda_stream_;
+    cv::Ptr<cv::cuda::StereoSGM> cuda_matcher_;
+    cv::cuda::GpuMat cuda_left_, cuda_right_, cuda_left_gray_, cuda_right_gray_;
+    cv::cuda::GpuMat cuda_fixed_, cuda_pixels_, cuda_xyz_;
+#endif
 };
 }

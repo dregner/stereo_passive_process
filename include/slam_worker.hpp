@@ -52,6 +52,7 @@ public:
         double clahe_clip{2.0};
         int    clahe_tiles{8};
         bool   clahe_enabled{false};
+        std::string trace_path; ///< Optional tracking timing/state CSV
     };
 
     using PosePub   = rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr;

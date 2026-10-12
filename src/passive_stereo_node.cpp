@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include <opencv2/imgproc.hpp>
+#include "cuda_color_converter.hpp"
 
 namespace passive_stereo_capture
 {
@@ -49,6 +50,8 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("trigger_mode",       false);
     declare_parameter("trigger_delay_us",   29);
     declare_parameter("trigger_source", std::string("Line3"));
+    declare_parameter("trigger_activation", std::string("RisingEdge"));
+    declare_parameter("trigger_generator", std::string("gpio")); // gpio | external (standalone PWM)
     declare_parameter("max_consec_errors",  10);
     declare_parameter("sync_tolerance_ms",  0.0);
 
@@ -88,6 +91,10 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("stereo_disp12_max_diff", 1);
     declare_parameter("stereo_pre_filter_cap", 31);
     declare_parameter("stereo_texture_threshold", 10);
+    declare_parameter("stereo_cuda_p1", 10);
+    declare_parameter("stereo_cuda_p2", 120);
+    declare_parameter("opencv_reproject_on_gpu", false);
+    declare_parameter("color_conversion_backend", std::string("cpu"));
     declare_parameter("disparity_enabled",   true);
     declare_parameter("disp_publish_cloud", false);
     declare_parameter("depth_mode",          std::string("accurate"));
@@ -99,7 +106,9 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("confidence_alpha",    2.0);
     declare_parameter("publish_confidence",  true);
     declare_parameter("disp_frame_id",       std::string("Passive/left_camera_link"));
-    declare_parameter("depth_process_hz", 0.0);
+    declare_parameter("depth_process_hz", 10.0);
+    declare_parameter("disparity_nice", 5);
+    declare_parameter("slam_trace_path", std::string(""));
     declare_parameter("disparity_rectify_on_cpu", false);
     declare_parameter("disparity_trace_path", std::string(""));
     declare_parameter("opencv_threads", 0);
@@ -120,6 +129,16 @@ void PassiveStereoNode::declareParameters()
 
 void PassiveStereoNode::init()
 {
+    const auto trigger_generator = get_parameter("trigger_generator").as_string();
+    if (trigger_generator != "gpio" && trigger_generator != "external")
+        throw std::invalid_argument("trigger_generator must be gpio or external");
+    const auto color_backend = get_parameter("color_conversion_backend").as_string();
+    if (color_backend != "cpu" && color_backend != "cuda")
+        throw std::invalid_argument("color_conversion_backend must be cpu or cuda");
+#ifndef PASSIVE_HAVE_OPENCV_CUDA
+    if (color_backend == "cuda" || get_parameter("opencv_reproject_on_gpu").as_bool())
+        throw std::invalid_argument("CUDA processing requires an OpenCV build with CUDA modules");
+#endif
     const int cv_threads = get_parameter("opencv_threads").as_int();
     if (cv_threads > 0) cv::setNumThreads(cv_threads);
     const std::string ns = get_parameter("namespace").as_string();
@@ -174,6 +193,7 @@ void PassiveStereoNode::init()
         slam_cfg.clahe_clip      = clahe_clip_val;
         slam_cfg.clahe_tiles     = clahe_tiles_val;
         slam_cfg.clahe_enabled   = enable_clahe_val;
+        slam_cfg.trace_path      = get_parameter("slam_trace_path").as_string();
 
         slam_worker_ = std::make_unique<SlamWorker>(
             this, pub_pose, pub_cloud, pub_path, slam_cfg);
@@ -206,6 +226,9 @@ void PassiveStereoNode::init()
         disp_cfg.stereo.disp12_max_diff = get_parameter("stereo_disp12_max_diff").as_int();
         disp_cfg.stereo.pre_filter_cap = get_parameter("stereo_pre_filter_cap").as_int();
         disp_cfg.stereo.texture_threshold = get_parameter("stereo_texture_threshold").as_int();
+        disp_cfg.stereo.cuda_p1 = get_parameter("stereo_cuda_p1").as_int();
+        disp_cfg.stereo.cuda_p2 = get_parameter("stereo_cuda_p2").as_int();
+        disp_cfg.reproject_on_gpu = get_parameter("opencv_reproject_on_gpu").as_bool();
         disp_cfg.depth_mode          = get_parameter("depth_mode").as_string();
         disp_cfg.max_dist            = get_parameter("max_dist").as_double();
         disp_cfg.sampling_factor     = get_parameter("sampling_factor").as_double();
@@ -225,6 +248,9 @@ void PassiveStereoNode::init()
             throw std::invalid_argument("depth_width/depth_height must both be zero or both positive");
         }
         disp_cfg.process_hz = get_parameter("depth_process_hz").as_double();
+        disp_cfg.nice = get_parameter("disparity_nice").as_int();
+        if (disp_cfg.nice < 0 || disp_cfg.nice > 19)
+            throw std::invalid_argument("disparity_nice must be in [0, 19]");
         disp_cfg.rectify_on_cpu = get_parameter("disparity_rectify_on_cpu").as_bool();
         disp_cfg.trace_path = get_parameter("disparity_trace_path").as_string();
         if (!std::isfinite(disp_cfg.process_hz) || disp_cfg.process_hz < 0)
@@ -274,6 +300,7 @@ void PassiveStereoNode::init()
     cam_cfg.balance_white_auto     = get_parameter("balance_white_auto").as_bool();
     cam_cfg.trigger_mode           = trigger_enabled_;
     cam_cfg.trigger_source = get_parameter("trigger_source").as_string();
+    cam_cfg.trigger_activation = get_parameter("trigger_activation").as_string();
     cam_cfg.trigger_delay_us       = get_parameter("trigger_delay_us").as_int();
     cam_cfg.binning                = get_parameter("binning").as_int();
     cam_cfg.max_consecutive_errors = get_parameter("max_consec_errors").as_int();
@@ -286,7 +313,7 @@ void PassiveStereoNode::init()
     grabber_->start();
 
     // ── GPIO Trigger (started AFTER cameras are fully armed!) ─────────────────
-    if (trigger_enabled_) {
+    if (trigger_enabled_ && trigger_generator == "gpio") {
         std::string chip = get_parameter("gpio_chip").as_string();
         int line         = get_parameter("gpio_line").as_int();
         double fps       = get_parameter("frame_rate").as_double();
@@ -364,13 +391,27 @@ void PassiveStereoNode::onStereoFrame(
 
 void PassiveStereoNode::preprocessThread()
 {
+    // The stream and buffers belong only to the color worker. SLAM still receives
+    // raw Bayer frames first and never waits for GPU color conversion.
+    CudaColorConverter cuda_color;
+    const bool use_cuda = get_parameter("color_conversion_backend").as_string() == "cuda";
     while (preprocess_running_.load()) {
         StereoFramePtr raw_frame;
         if (!preprocess_queue_.pop(raw_frame)) continue;
         // Separate frame metadata prevents races with the already running SLAM worker.
         auto color_frame = std::make_shared<StereoFrame>(*raw_frame);
-        cv::cvtColor(raw_frame->left_raw, color_frame->left_rgb, cv::COLOR_BayerRG2RGB);
-        cv::cvtColor(raw_frame->right_raw, color_frame->right_rgb, cv::COLOR_BayerRG2RGB);
+        if (use_cuda) {
+            try { cuda_color.convertPair(raw_frame->left_raw, raw_frame->right_raw,
+                color_frame->left_rgb, color_frame->right_rgb); }
+            catch (const std::exception & e) {
+                RCLCPP_ERROR(get_logger(), "CUDA color conversion failed: %s", e.what());
+                rclcpp::shutdown();
+                return;
+            }
+        } else {
+            cv::cvtColor(raw_frame->left_raw, color_frame->left_rgb, cv::COLOR_BayerRG2RGB);
+            cv::cvtColor(raw_frame->right_raw, color_frame->right_rgb, cv::COLOR_BayerRG2RGB);
+        }
         if (disp_worker_) disp_worker_->push(color_frame);
         if (prev_worker_) prev_worker_->push(color_frame);
     }

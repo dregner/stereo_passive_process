@@ -29,6 +29,7 @@ struct CameraConfig {
     bool        balance_white_auto{true};
     bool        trigger_mode{false};        ///< true = hardware trigger on Line3
     std::string trigger_source{"Line3"};    ///< Camera input line, e.g. Line2
+    std::string trigger_activation{"RisingEdge"};
     int         trigger_delay_us{29};       ///< microseconds
     int         binning{1};                 ///< 1 = full resolution
     int         acquire_timeout_ms{2000};

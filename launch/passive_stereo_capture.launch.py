@@ -9,7 +9,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'params_file',
-            default_value='/home/daniel/ros2_ws/src/passive_stereo_capture/config/passive_stereo_pc.yaml',
+            default_value='/home/jetson/ros2_ws/src/stereo_passive_process/config/passive_stereo.yaml',
             description='Path to the passive_stereo YAML parameter file'),
 
         DeclareLaunchArgument(

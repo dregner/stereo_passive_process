@@ -1,6 +1,7 @@
 #include "slam_worker.hpp"
 
 #include <opencv2/imgproc.hpp>
+#include <fstream>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
@@ -96,9 +97,10 @@ tf2::Transform SlamWorker::sophusToTf(const Sophus::SE3f & pose)
                       R(1,0),R(1,1),R(1,2),
                       R(2,0),R(2,1),R(2,2));
     tf2::Vector3 tv(t(0), t(1), t(2));
-
-    Rm = kOrbToRosEnu * Rm;
-    tv = kOrbToRosEnu * tv;
+    if (cfg_.enu_publish) {
+        Rm = kOrbToRosEnu * Rm;// * kOrbToRosEnu.transpose();
+        tv = kOrbToRosEnu * tv;
+    }
     return tf2::Transform(Rm, tv);
 }
 
@@ -107,7 +109,7 @@ void SlamWorker::publishPose(
 {
     tf2::Transform T_map_cam = sophusToTf(se3.inverse());
 
-    tf2::Transform T_zeroed;
+    tf2::Transform T_zeroed = T_map_cam;
     if (tf_cached_) {
         tf2::Transform T_cam_base = T_base_cam_.inverse();
         tf2::Transform T_map_base = T_map_cam * T_cam_base;
@@ -115,19 +117,18 @@ void SlamWorker::publishPose(
         if (!initial_offset_set_) {
             initial_offset_.setIdentity();
             initial_offset_.setOrigin(T_map_base.getOrigin());
+            // initial_offset_ = T_map_base;
             initial_offset_set_ = true;
         }
         T_zeroed = initial_offset_.inverse() * T_map_base;
-    } else {
-        if (!initial_offset_set_) {
-            initial_offset_.setIdentity();
-            initial_offset_.setOrigin(T_map_cam.getOrigin());
-            initial_offset_set_ = true;
-        }
-        T_zeroed = initial_offset_.inverse() * T_map_cam;
-    }
-
+    } 
     if (cfg_.tf_publish) {
+        if(!tf_cached_) {
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                "SlamWorker: TF [%s -> %s] not yet available; publishing pose in "
+                "camera frame until TF arrives",
+                cfg_.parent_frame_id.c_str(), cfg_.child_frame_id.c_str());
+        }
         geometry_msgs::msg::TransformStamped ts;
         ts.header.stamp    = stamp;
         ts.header.frame_id = cfg_.frame_id;
@@ -217,6 +218,14 @@ void SlamWorker::publishCloud(const rclcpp::Time & stamp)
 
 void SlamWorker::run()
 {
+    std::ofstream trace;
+    if (!cfg_.trace_path.empty()) {
+        trace.open(cfg_.trace_path);
+        if (!trace) RCLCPP_WARN(node_->get_logger(), "Cannot open SLAM trace file");
+        else trace << "frame_id,stamp_ns,frame_gap,queue_ms,track_ms,total_ms,state\n";
+    }
+    uint64_t previous_frame_id = 0;
+    bool have_previous_frame = false;
     while (running_.load()) {
         StereoFramePtr frame;
         if (!queue_.pop(frame)) continue;
@@ -236,16 +245,11 @@ void SlamWorker::run()
         cv::cvtColor(frame->left_raw,  left_gray,  cv::COLOR_BayerRG2GRAY);
         cv::cvtColor(frame->right_raw, right_gray, cv::COLOR_BayerRG2GRAY);
 
-        // User guidance: "below 800x600 you use full size"
-        double effective_scale = cfg_.scale_factor;
-        if (left_gray.cols <= 800 && left_gray.rows <= 600) {
-            effective_scale = 1.0;
-        }
 
         cv::Mat left_small, right_small;
-        if (effective_scale != 1.0 && effective_scale > 0.0) {
-            cv::resize(left_gray,  left_small,  cv::Size(), effective_scale, effective_scale, cv::INTER_LINEAR);
-            cv::resize(right_gray, right_small, cv::Size(), effective_scale, effective_scale, cv::INTER_LINEAR);
+        if (cfg_.scale_factor != 1.0 && cfg_.scale_factor > 0.0) {
+            cv::resize(left_gray,  left_small,  cv::Size(), cfg_.scale_factor, cfg_.scale_factor, cv::INTER_LINEAR);
+            cv::resize(right_gray, right_small, cv::Size(), cfg_.scale_factor, cfg_.scale_factor, cv::INTER_LINEAR);
         } else {
             left_small  = left_gray;
             right_small = right_gray;
@@ -256,7 +260,9 @@ void SlamWorker::run()
             clahe_gray_->apply(right_small, right_small);
         }
 
+        const auto tracking_start = std::chrono::steady_clock::now();
         auto se3  = slam_->TrackStereo(left_small, right_small, frame->timestamp_sec);
+        const auto tracking_finish = std::chrono::steady_clock::now();
         int state = slam_->GetTrackingState();
         last_tracking_state_.store(state);
         processed_frames_++;
@@ -279,6 +285,19 @@ void SlamWorker::run()
         }
         if (pub_cloud_now) publishCloud(frame->stamp);
         metrics_.record(processing_start, frame->received_at);
+        if (trace) {
+            const auto ms = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b-a).count();
+            };
+            const auto gap = have_previous_frame && frame->frame_id >= previous_frame_id
+                ? frame->frame_id - previous_frame_id : 0;
+            trace << frame->frame_id << ',' << frame->stamp.nanoseconds() << ',' << gap << ','
+                  << ms(frame->received_at, processing_start) << ','
+                  << ms(tracking_start, tracking_finish) << ','
+                  << ms(processing_start, std::chrono::steady_clock::now()) << ',' << state << '\n';
+        }
+        previous_frame_id = frame->frame_id;
+        have_previous_frame = true;
     }
 }
 

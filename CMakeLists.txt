@@ -20,7 +20,12 @@ find_package(tf2_ros        REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 
 # ---- OpenCV ---------------------------------------------------------------
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d OPTIONAL_COMPONENTS stereo)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d
+  OPTIONAL_COMPONENTS stereo cudaimgproc cudastereo cudaarithm)
+if(OpenCV_cudaimgproc_FOUND AND OpenCV_cudastereo_FOUND AND OpenCV_cudaarithm_FOUND)
+  add_compile_definitions(PASSIVE_HAVE_OPENCV_CUDA=1)
+  message(STATUS "OpenCV CUDA color conversion, StereoSGM and reprojection enabled")
+endif()
 if(NOT OpenCV_stereo_FOUND)
   add_compile_definitions(PASSIVE_DISABLE_BINARY_STEREO=1)
   message(STATUS "OpenCV contrib stereo unavailable: BM/SGBM and Retinify remain enabled")

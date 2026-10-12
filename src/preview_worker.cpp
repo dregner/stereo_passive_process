@@ -55,7 +55,7 @@ void PreviewWorker::encodeAndPublish(
 
     cv::Mat bgr;
     if (cfg_.clahe_enabled) {
-        bgr = applyClaheBGR(resized, clahe_);
+        bgr = applyClaheRGB(resized, clahe_);
     } else {
         // cv::cvtColor(resized, bgr, cv::COLOR_RGB2BGR);
         bgr = resized;  // No color conversion needed to show in foxglove, which expects RGB images.

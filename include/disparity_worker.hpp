@@ -48,7 +48,9 @@ public:
         int width{0};                         ///< 0/0 = native; positive pair = software resize
         int height{0};
         double cloud_hz{15.0};      ///< Max frequency to publish pointcloud
-        double process_hz{0.0};    ///< 0 = every available pair; positive = bound inference work
+        double process_hz{10.0};   ///< 0 = every available pair; positive = bound inference work
+        int nice{5};              ///< Linux CPU scheduling niceness for background depth work
+        bool reproject_on_gpu{false}; ///< Also allow CPU matchers to reproject on CUDA
         bool rectify_on_cpu{false}; ///< Retinify: optional OpenCV rectification before inference
         std::string trace_path;   ///< Optional per-frame CSV profiling
         double image_hz{10.0};     ///< Max frequency to publish disparity visualization

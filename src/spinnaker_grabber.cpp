@@ -218,6 +218,7 @@ void SpinnakerGrabber::configureCamera(CameraPtr cam, bool is_left)
         setEnum(cam, "LineMode",      "Input");
         setEnum(cam, "TriggerSelector", "FrameStart");
         setEnum(cam, "TriggerSource", cfg_.trigger_source);
+        setEnum(cam, "TriggerActivation", cfg_.trigger_activation);
         setEnum(cam, "TriggerOverlap",  "ReadOut");
         setFloat(cam, "TriggerDelay",   static_cast<double>(cfg_.trigger_delay_us));
         setEnum(cam, "TriggerMode",     "On");

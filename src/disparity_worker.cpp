@@ -5,6 +5,10 @@
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <cerrno>
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -226,6 +230,16 @@ size_t DisparityWorker::compactCloud(
 
 void DisparityWorker::run()
 {
+#ifdef __linux__
+    // On Linux PRIO_PROCESS with id=0 addresses this thread. Keep acquisition
+    // and tracking at their existing priority, and never increase our priority.
+    if (cfg_.nice > 0) {
+        errno = 0;
+        const int current = getpriority(PRIO_PROCESS, 0);
+        if (errno || setpriority(PRIO_PROCESS, 0, std::max(current, cfg_.nice)) != 0)
+            std::cerr << "[DisparityWorker] Could not lower depth thread CPU priority\n";
+    }
+#endif
     std::ofstream trace;
     if (!cfg_.trace_path.empty()) {
         trace.open(cfg_.trace_path);
@@ -349,9 +363,14 @@ void DisparityWorker::run()
         if (pub_cloud_now && (conventional_ || h_pinned_xyz_)) {
             const float * xyz_ptr = h_pinned_xyz_;
             if (conventional_) {
-                cv::reprojectImageTo3D(conventional_disp_, conventional_xyz_,
+                try {
+                conventional_->reproject(conventional_disp_, conventional_xyz_,
                     ConventionalStereo::scaledQ(calib_.Q(), cv::Size(calib_.width(), calib_.height()),
-                        input_left.size()), false, CV_32F);
+                        input_left.size()), conventional_->isCuda() || cfg_.reproject_on_gpu);
+                } catch (const std::exception & e) {
+                    std::cerr << "[DisparityWorker] Reprojection failed: " << e.what() << std::endl;
+                    continue;
+                }
                 xyz_ptr = conventional_xyz_.ptr<float>();
                 cpu_point_buf_.resize(static_cast<size_t>(W) * H *
                     (cfg_.publish_confidence ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB)));
