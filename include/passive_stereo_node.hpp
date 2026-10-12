@@ -52,6 +52,10 @@ private:
     std::unique_ptr<PreviewWorker>     prev_worker_;
     std::unique_ptr<GpioTrigger>       gpio_trigger_;
 
+    bool color_correction_enabled_{false};
+    cv::Matx33f color_ccm_left_{cv::Matx33f::eye()};
+    cv::Matx33f color_ccm_right_{cv::Matx33f::eye()};
+
     // ── CLAHE ─────────────────────────────────────────────────────────────────
     cv::Ptr<cv::CLAHE> clahe_;
 

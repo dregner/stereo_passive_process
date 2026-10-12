@@ -170,6 +170,16 @@ void SpinnakerGrabber::configureCamera(CameraPtr cam, bool is_left)
     // ── Pixel format — keep as raw Bayer ─────────────────────────────────────
     setEnum(cam, "PixelFormat", "BayerRG8");
 
+    // Host CCM is applied after demosaicing; avoid applying a second camera CCM.
+    if (cfg_.host_color_correction) {
+        CBooleanPtr enabled = cam->GetNodeMap().GetNode("ColorTransformationEnable");
+        if (IsAvailable(enabled)) {
+            if (IsWritable(enabled)) enabled->SetValue(false);
+            if (!IsReadable(enabled) || enabled->GetValue())
+                throw std::runtime_error("Cannot disable camera CCM for host color correction");
+        }
+    }
+
     // ── Binning ───────────────────────────────────────────────────────────────
     if (cfg_.binning > 1) {
         setInt(cam, "BinningHorizontal", cfg_.binning);
@@ -198,6 +208,8 @@ void SpinnakerGrabber::configureCamera(CameraPtr cam, bool is_left)
     // ── White balance ─────────────────────────────────────────────────────────
     if (cfg_.balance_white_auto) {
         setEnum(cam, "BalanceWhiteAuto", "Continuous");
+    } else {
+        setEnum(cam, "BalanceWhiteAuto", "Off");
     }
 
     // ── Chunk data (FrameID + Timestamp) ──────────────────────────────────────

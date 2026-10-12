@@ -8,6 +8,7 @@
 
 #include <opencv2/imgproc.hpp>
 #include "cuda_color_converter.hpp"
+#include "color_correction.hpp"
 
 namespace passive_stereo_capture
 {
@@ -46,6 +47,9 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("gain",               0.0);
     declare_parameter("gain_auto",          false);
     declare_parameter("balance_white_auto", true);
+    declare_parameter("color_correction_enabled", false);
+    declare_parameter("color_ccm_left", std::vector<double>{1,0,0,0,1,0,0,0,1});
+    declare_parameter("color_ccm_right", std::vector<double>{1,0,0,0,1,0,0,0,1});
     declare_parameter("binning",            1);
     declare_parameter("trigger_mode",       false);
     declare_parameter("trigger_delay_us",   29);
@@ -129,6 +133,13 @@ void PassiveStereoNode::declareParameters()
 
 void PassiveStereoNode::init()
 {
+    color_correction_enabled_ = get_parameter("color_correction_enabled").as_bool();
+    if (color_correction_enabled_) {
+        color_ccm_left_ = colorCorrectionMatrix(get_parameter("color_ccm_left").as_double_array());
+        color_ccm_right_ = colorCorrectionMatrix(get_parameter("color_ccm_right").as_double_array());
+        RCLCPP_INFO(get_logger(), "Host RGB color correction enabled (separate left/right CCMs)");
+    }
+
     const auto trigger_generator = get_parameter("trigger_generator").as_string();
     if (trigger_generator != "gpio" && trigger_generator != "external")
         throw std::invalid_argument("trigger_generator must be gpio or external");
@@ -297,6 +308,7 @@ void PassiveStereoNode::init()
     cam_cfg.exposure_time_us       = get_parameter("exposure_time").as_double();
     cam_cfg.gain_db                = get_parameter("gain").as_double();
     cam_cfg.gain_auto              = get_parameter("gain_auto").as_bool();
+    cam_cfg.host_color_correction  = color_correction_enabled_;
     cam_cfg.balance_white_auto     = get_parameter("balance_white_auto").as_bool();
     cam_cfg.trigger_mode           = trigger_enabled_;
     cam_cfg.trigger_source = get_parameter("trigger_source").as_string();
@@ -411,6 +423,10 @@ void PassiveStereoNode::preprocessThread()
         } else {
             cv::cvtColor(raw_frame->left_raw, color_frame->left_rgb, cv::COLOR_BayerRG2RGB);
             cv::cvtColor(raw_frame->right_raw, color_frame->right_rgb, cv::COLOR_BayerRG2RGB);
+        }
+        if (color_correction_enabled_) {
+            correctRgb(color_frame->left_rgb, color_ccm_left_);
+            correctRgb(color_frame->right_rgb, color_ccm_right_);
         }
         if (disp_worker_) disp_worker_->push(color_frame);
         if (prev_worker_) prev_worker_->push(color_frame);

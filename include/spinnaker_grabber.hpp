@@ -27,6 +27,7 @@ struct CameraConfig {
     double      gain_db{0.0};               ///< dB; applied only if gain_auto=Off
     bool        gain_auto{false};
     bool        balance_white_auto{true};
+    bool        host_color_correction{false};
     bool        trigger_mode{false};        ///< true = hardware trigger on Line3
     std::string trigger_source{"Line3"};    ///< Camera input line, e.g. Line2
     std::string trigger_activation{"RisingEdge"};
