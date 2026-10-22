@@ -9,12 +9,41 @@
 #include <sstream>
 #include <array>
 #include <cmath>
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 
 namespace fs = std::filesystem;
 using namespace Spinnaker;
 using namespace Spinnaker::GenApi;
 static const char* view = "Stereo: left | right";
 static const char* controls = "Stereo controls";
+
+bool windowClosed(const char* name, bool& was_visible) {
+    // Some HighGUI backends report -1 (unsupported), and forwarded X11 windows
+    // may report 0 while being mapped. Neither means a new window was closed.
+    try {
+        const double visible = cv::getWindowProperty(name,cv::WND_PROP_VISIBLE);
+        if (visible >= 1) was_visible = true;
+        return was_visible && visible < 1;
+    } catch (const cv::Exception&) {
+        // Qt can throw when a previously visible window has been destroyed.
+        return was_visible;
+    }
+}
+
+int environmentInteger(const char* name, int fallback, int minimum, int maximum) {
+    const char* raw = std::getenv(name);
+    if (!raw) return fallback;
+    try {
+        size_t used = 0;
+        int result = std::stoi(raw, &used);
+        if (used == std::string(raw).size() && result >= minimum && result <= maximum)
+            return result;
+    } catch (const std::exception&) {}
+    throw std::runtime_error(std::string(name)+" must be an integer between "+
+                             std::to_string(minimum)+" and "+std::to_string(maximum));
+}
 
 void enumeration(CameraPtr c, const char* name, const char* value) {
     CEnumerationPtr n = c->GetNodeMap().GetNode(name);
@@ -83,6 +112,9 @@ int main(int argc, char** argv) {
         return argc < 2 ? 1 : 0;
     }
     try {
+        const int preview_width = environmentInteger("STEREO_GUI_PREVIEW_WIDTH", 0, 0, 16384);
+        const int preview_fps = environmentInteger("STEREO_GUI_PREVIEW_FPS", 30, 1, 120);
+        bool fullscreen = environmentInteger("STEREO_GUI_FULLSCREEN", 1, 0, 1) != 0;
         auto config = YAML::LoadFile(argv[1]);
         if (config["passive_stereo_node"]) config = config["passive_stereo_node"]["ros__parameters"];
         fs::path output = argc > 2 ? argv[2] : value<std::string>(config,"capture_folder","stereo_pairs");
@@ -119,7 +151,8 @@ int main(int argc, char** argv) {
         int exp_mode=mode("exposure_auto",0), gain_mode=mode("gain_mode",value<bool>(config,"gain_auto",false)?2:0);
         int wb_mode=mode("white_balance_mode",value<bool>(config,"balance_white_auto",true)?2:0);
         cv::namedWindow(view,cv::WINDOW_NORMAL | cv::WINDOW_KEEPRATIO);
-        cv::setWindowProperty(view,cv::WND_PROP_FULLSCREEN,cv::WINDOW_FULLSCREEN);
+        if (fullscreen) cv::setWindowProperty(view,cv::WND_PROP_FULLSCREEN,cv::WINDOW_FULLSCREEN);
+        else cv::resizeWindow(view,preview_width > 0 ? preview_width : 1280,480);
         cv::namedWindow(controls,cv::WINDOW_NORMAL); cv::resizeWindow(controls,650,550);
         auto track = [&](const char* name, int& initial, int max) {
             initial=std::clamp(initial,0,max);
@@ -139,7 +172,14 @@ int main(int argc, char** argv) {
         std::array<int,7> previous {-1,-1,-1,-1,-1,-1,-1};
         std::string status="Ready. Modes: 0 manual, 1 once, 2 continuous";
         std::array<cv::Mat,2> pair;
-        ImageProcessor processor; unsigned index=0; bool fullscreen=true;
+        ImageProcessor processor; unsigned index=0;
+        using Clock = std::chrono::steady_clock;
+        auto next_preview = Clock::now();
+        const auto preview_interval = std::chrono::microseconds(1000000 / preview_fps);
+        std::string displayed_status;
+        std::cout << "Capture folder (on this computer): " << fs::absolute(output) << '\n'
+                  << "Preview: " << preview_fps << " FPS, width " << preview_width
+                  << " (0 = native). Saved images retain native resolution.\n";
         auto apply = [&] {
             std::array<int,7> now {cv::getTrackbarPos("Exposure us",controls),cv::getTrackbarPos("Gain x0.1 dB",controls),cv::getTrackbarPos("Exposure auto",controls),cv::getTrackbarPos("Gain auto",controls),cv::getTrackbarPos("White balance auto",controls),cv::getTrackbarPos("Red x0.01",controls),cv::getTrackbarPos("Blue x0.01",controls)};
             if(now==previous) return;
@@ -163,6 +203,7 @@ int main(int argc, char** argv) {
         apply();
         for(auto c:session.cameras) c->BeginAcquisition();
         int failures=0;
+        bool view_was_visible=false, controls_were_visible=false;
         while(true) {
             apply(); bool complete=true;
             for(int side=0;side<2;++side) {
@@ -177,17 +218,40 @@ int main(int argc, char** argv) {
             if(complete) {
                 failures=0;
                 if(pair[0].size()!=pair[1].size()) throw std::runtime_error("Camera image dimensions differ");
-                cv::Mat stereo; cv::hconcat(pair[0],pair[1],stereo); cv::imshow(view,stereo);
+                if (Clock::now() >= next_preview) {
+                    cv::Mat stereo;
+                    if (preview_width > 0 && pair[0].cols * 2 > preview_width) {
+                        // Resize before sending pixels through X11; keep native images for saving.
+                        std::array<cv::Mat,2> small;
+                        const int width = std::max(1, preview_width / 2);
+                        const int height = std::max(1, int(std::lround(double(pair[0].rows) * width / pair[0].cols)));
+                        for (int side=0;side<2;++side)
+                            cv::resize(pair[side],small[side],{width,height},0,0,cv::INTER_AREA);
+                        cv::hconcat(small[0],small[1],stereo);
+                    } else cv::hconcat(pair[0],pair[1],stereo);
+                    cv::imshow(view,stereo);
+                    next_preview = Clock::now() + preview_interval;
+                }
                 if(save_requested) { try { savePair(output,pair,index); status="Saved pair "+std::to_string(index-1)+" to "+output.string(); } catch(const std::exception& e) {status=e.what();} save_requested=false; }
             } else if(++failures>=30) throw std::runtime_error("Repeated capture failures: "+status);
-            cv::Mat panel(150,650,CV_8UC3,cv::Scalar(35,35,35));
-            cv::rectangle(panel,{10,15},{290,65},cv::Scalar(60,140,60),cv::FILLED);
-            cv::putText(panel,"SAVE IMAGE PAIR (S)",{20,47},cv::FONT_HERSHEY_SIMPLEX,.65,{255,255,255},1);
-            cv::putText(panel,"0: manual   1: once   2: continuous",{10,95},cv::FONT_HERSHEY_SIMPLEX,.55,{255,255,255},1);
-            cv::putText(panel,status.substr(0,85),{10,125},cv::FONT_HERSHEY_SIMPLEX,.4,{255,255,255},1);
-            cv::imshow(controls,panel);
+            if (status != displayed_status) {
+                cv::Mat panel(150,650,CV_8UC3,cv::Scalar(35,35,35));
+                cv::rectangle(panel,{10,15},{290,65},cv::Scalar(60,140,60),cv::FILLED);
+                cv::putText(panel,"SAVE IMAGE PAIR (S)",{20,47},cv::FONT_HERSHEY_SIMPLEX,.65,{255,255,255},1);
+                cv::putText(panel,"0: manual   1: once   2: continuous",{10,95},cv::FONT_HERSHEY_SIMPLEX,.55,{255,255,255},1);
+                cv::putText(panel,status.substr(0,85),{10,125},cv::FONT_HERSHEY_SIMPLEX,.4,{255,255,255},1);
+                cv::imshow(controls,panel);
+                displayed_status = status;
+            }
             int key=cv::waitKey(1)&255;
-            if(key==27 || key=='q' || cv::getWindowProperty(view,cv::WND_PROP_VISIBLE)<1 || cv::getWindowProperty(controls,cv::WND_PROP_VISIBLE)<1) break;
+            if(key==27 || key=='q') {
+                std::cout << "Closing viewer: Q/Esc pressed.\n";
+                break;
+            }
+            if(windowClosed(view,view_was_visible) || windowClosed(controls,controls_were_visible)) {
+                std::cout << "Closing viewer: a previously visible window was closed.\n";
+                break;
+            }
             if(key=='s') save_requested=true;
             if(key=='f') { fullscreen=!fullscreen; cv::setWindowProperty(view,cv::WND_PROP_FULLSCREEN,fullscreen?cv::WINDOW_FULLSCREEN:cv::WINDOW_NORMAL); }
         }
