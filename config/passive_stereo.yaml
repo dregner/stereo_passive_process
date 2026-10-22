@@ -1,79 +1,86 @@
 passive_stereo_node:
   ros__parameters:
-    # ---- Camera serials (match your BFS cameras) --------------------------
-    cam_left_serial:  "16378753"
-    cam_right_serial: "16378754"
-
-    # ---- Acquisition settings -------------------------------------------
-    frame_rate:         30.0
-    exposure_time:      16667.0   # microseconds (1/30 s)
-    gain:               0.0        # dB (used only when gain_auto=false)
-    gain_auto:          false
+  # --- Camera parameters
+    cam_left_serial: '23267854'
+    cam_right_serial: '23267852'
+    frame_rate: 30.0
+    exposure_time: 166667.0
+    gain: 0.0
+    gain_auto: true
     balance_white_auto: true
-    binning:            1          # 1 = full native resolution
+    binning: 1
 
-    # ---- Camera disconnect recovery --------------------------------------
-    # Consecutive grab errors before triggering rclcpp::shutdown()
-    max_consec_errors:  10
-
-    # ---- Trigger mode ----------------------------------------------------
-    # true  -> hardware trigger via Jetson GPIO PWM (camera Line3)
-    # false -> free-running continuous acquisition
-    trigger_mode:     false
-    trigger_delay_us: 29
-
-    # ---- Jetson GPIO for PWM trigger generation -------------------------
-    # Jetson Orin Nano: line 85 = PN.01 (GPIO27) = trigger output
-    # Run 'gpioinfo gpiochip0' to confirm pin assignments.
-    gpio_chip: "gpiochip0"
-    gpio_line: 85       # PN.01 = trigger line on Jetson Orin (NOT 106 which is laser)
-
-    # ---- Stereo calibration ---------------------------------------------
-    # OpenCV FileStorage YAML with K1, D1, K2, D2, R, T matrices.
-    # See config/stereo_calibration_template.yaml for the format.
-    calibration_file: "/home/jetson/ros2_ws/src/passive_stereo_capture/config/stereo_calibration_lab.yaml"
-
-    # ---- CLAHE (full-res Lab L-channel, for Retinify + Preview) ---------
-    # SLAM receives raw rectified and applies its own grayscale CLAHE post-resize.
+    color_correction_enabled: false
+    color_ccm_left: [29.213605089775285, 2.336824461775791, 1.585608194477004, -14.19204788204803, 49.06405813320123, -0.3796234886228831, 0.6292478357080995, -15.627420591433975, 47.17331989883024]
+    color_ccm_right: [32.414494347141044, 7.110613864250126, -0.5058262554192652, -19.071085585542164, 63.38834210343407, -4.772730831379022, -15.620491146197253, 3.8475047183801507, 49.60592500211055]
+    # --- Stereo params
+    calibration_file: /home/jetson/ros2_ws/src/stereo_passive_process/config/stereo_calibration_bfs.yaml
     clahe_clip_limit: 2.0
-    clahe_tile_size:  8
+    clahe_tile_size: 8
     enable_clahe: false
+    
+    # --- Trigger mode
+    trigger_mode: true
+    trigger_source: Line2
+    trigger_activation: RisingEdge
+    max_consec_errors: 10
+    sync_tolerance_ms: 25.0
+    trigger_generator: gpio
+    gpio_chip: gpiochip0
+    gpio_line: 144
 
-    # ---- SLAM (ORB-SLAM3) ------------------------------------------------
-    slam_enabled: true
-    slam_voc_file: "/home/jetson/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/vocabulary/ORBvoc.txt"
-    slam_settings_file: "/home/jetson/ros2_ws/src/voris_bringup/config/20260717_passivo_slam.yaml"
-    slam_use_pangolin: false   # set true to open Pangolin viewer (needs X11)
-    slam_scale_factor: 0.5   
+
+    # --- SLAM parameters
+    slam_enabled: false
     slam_enu_publish: true
-    slam_tf_publish:  false
-    slam_cloud_hz:    5.0      # max rate to publish sparse map cloud (GetAllMapPoints is expensive)
-
-    # ---- Coordinate frames -----------------------------------------------
-    namespace:        "Passive"
-    frame_id:         "map"
-    parent_frame_id:  "base_link"
-    child_frame_id:   "Passive/left_camera_link"
-
-    # ---- Disparity (Retinify GPU) ----------------------------------------
-    disparity_enabled: true
+    slam_tf_publish: true
+    slam_use_pangolin: false
+    slam_voc_file: /home/jetson/ros2_ws/src/orbslam3_ros2/orbslam3_ros2/vocabulary/ORBvoc.txt
+    slam_settings_file: /home/jetson/ros2_ws/src/stereo_passive_process/config/bfs_slam.yaml
+    slam_scale_factor: 1.0
+    slam_cloud_hz: 5.0
+    # --- TF parameters
+    namespace: Passive
+    frame_id: map
+    parent_frame_id: base_link
+    child_frame_id: Passive/left_camera_link
+    # --- Disparity parameters
+    disparity_enabled: false
+    disp_publish_cloud: true  # compressed color disparity only
+    disparity_rectify_on_cpu: true # Retinify rectifies; OpenCV always rectifies
+    disparity_backend: "retinify"  # retinify | stereobm | stereosgbm | stereobinary | cuda_sgm
+    depth_mode:       "accurate"   # "fast" | "balanced" | "accurate"
+    color_conversion_backend: "cpu"  # cpu | cuda (Bayer to RGB)
+    stereo_cuda_p1: 10
+    stereo_cuda_p2: 120  # must exceed P1; cuda_sgm search must be 64, 128 or 256
+    stereo_min_disparity: 0
+    stereo_num_disparities: 128
+    stereo_block_size: 9
+    stereo_uniqueness_ratio: 10
+    stereo_speckle_window_size: 100
+    stereo_speckle_range: 2
+    stereo_disp12_max_diff: 1
+    stereo_pre_filter_cap: 31
+    stereo_texture_threshold: 10
+    depth_process_hz: 10.0  # Bound background work; acquisition remains 30 Hz
+    disparity_nice: 5      # Lower CPU priority than tracking on Linux
     depth_width:        0         # 0/0: native; e.g. 1600/1200 or 2448/2048 for load tests
     depth_height:       0
     disp_cloud_hz:      15.0
     disp_image_hz:      10.0
-    depth_mode:       "accurate"   # "fast" | "balanced" | "accurate"
     max_dist:         15.0         # metres; 0 = no limit
-    sampling_factor:  0.5          # point cloud decimation (0-1]: 0.5 = every other pixel
+    sampling_factor:  0.5         # point cloud decimation (0-1]: 0.5 = every other pixel
     crop_factor:      1.0         # central crop fraction (0-1]
     min_confidence:   0.35
-    confidence_radius: 2
+    confidence_radius: 5
     confidence_alpha: 2.0
-    publish_confidence: true
+    publish_confidence: false
     disp_frame_id:    "Passive/left_camera_link"
-
-    # ---- Preview streaming (unrectified raw perspective) ----------------
+    # --- Preview parameters
     preview_enabled: true
-    preview_width:   800
-    preview_height:  600
-    preview_quality: 30    # JPEG quality 0-100
-    preview_fps:     30.0  # Max publishing rate for preview (e.g. 10.0 Hz)
+    preview_width: 720
+    preview_height: 540
+    preview_quality: 100
+    preview_fps: 30.0
+    depth_process_hz: 10.0
+    disparity_nice: 5
