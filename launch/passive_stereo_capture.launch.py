@@ -18,15 +18,13 @@ def generate_launch_description():
                                                   'config', 'stereo_calibration_lab.yaml']),
             description='Path to the OpenCV stereo calibration YAML'),
 
-        DeclareLaunchArgument(
-            'slam',
-            default_value='false',
-            description='Enable SLAM'),
-        
-        DeclareLaunchArgument(
-            'disparity',
-            default_value='false',
-            description='Enable Disparity'),
+        DeclareLaunchArgument('slam', default_value='false', description='Enable SLAM'),
+
+        DeclareLaunchArgument('disparity', default_value='false', description='Enable Disparity'),
+
+        DeclareLaunchArgument('mavlink_enabled', default_value='false',  description='Open the MAVLink bridge inside the capture process'),
+        DeclareLaunchArgument('mavlink_bridge_url', default_value='udp://:14555@127.0.0.1:14550', description='libmavconn UDP, TCP or serial connection URL'),
+        DeclareLaunchArgument('mavlink_message', default_value='estimate', choices=['estimate', 'delta'], description='Vision MAVLink message type'),
 
         Node(
             package='passive_stereo_capture',
@@ -38,7 +36,10 @@ def generate_launch_description():
                 {
                     'calibration_file': LaunchConfiguration('calibration_file'),
                     'slam_enabled': LaunchConfiguration('slam'),
-                    'disparity_enabled': LaunchConfiguration('disparity')
+                    'disparity_enabled': LaunchConfiguration('disparity'),
+                    'mavlink_enabled': LaunchConfiguration('mavlink_enabled'),
+                    'mavlink_bridge_url': LaunchConfiguration('mavlink_bridge_url'),
+                    'mavlink_message': LaunchConfiguration('mavlink_message')
                 }
             ],
         ),

@@ -34,6 +34,7 @@ PassiveStereoNode::~PassiveStereoNode()
     // 3. Stop workers
     if (gpio_trigger_) gpio_trigger_->stop();
     if (slam_worker_)  slam_worker_->stop();
+    if (mavlink_worker_) mavlink_worker_->stop();
     if (disp_worker_)  disp_worker_->stop();
     if (prev_worker_)  prev_worker_->stop();
 }
@@ -123,6 +124,18 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("depth_height",        0);
     declare_parameter("disp_image_hz",       10.0);
 
+    // MAVLink: opening a connection is opt-in, independent of preview/depth.
+    declare_parameter("mavlink_enabled", false);
+    declare_parameter("mavlink_bridge_url", std::string("udp://:14555@127.0.0.1:14550"));
+    declare_parameter("mavlink_message", std::string("estimate"));
+    declare_parameter("mavlink_system_id", 1);
+    declare_parameter("mavlink_component_id", 197);
+    declare_parameter("mavlink_max_gap_sec", 0.5);
+    declare_parameter("mavlink_map_yaw_deg", 0.0);
+    declare_parameter("mavlink_position_variance", 0.05);
+    declare_parameter("mavlink_angle_variance", 0.1);
+    declare_parameter("mavlink_confidence", 100.0);
+
     // Preview
     declare_parameter("preview_enabled",  true);
     declare_parameter("preview_width",    612);
@@ -186,6 +199,23 @@ void PassiveStereoNode::init()
     double clahe_clip_val = get_parameter("clahe_clip_limit").as_double();
     bool enable_clahe_val = get_parameter("enable_clahe").as_bool();
 
+    if (get_parameter("mavlink_enabled").as_bool()) {
+        if (!slam_enabled_ || !get_parameter("slam_enu_publish").as_bool())
+            throw std::invalid_argument("MAVLink requires slam_enabled and slam_enu_publish");
+        MavlinkWorker::Config cfg;
+        cfg.bridge_url = get_parameter("mavlink_bridge_url").as_string();
+        cfg.message = get_parameter("mavlink_message").as_string();
+        cfg.system_id = get_parameter("mavlink_system_id").as_int();
+        cfg.component_id = get_parameter("mavlink_component_id").as_int();
+        cfg.max_gap_sec = get_parameter("mavlink_max_gap_sec").as_double();
+        cfg.map_yaw_deg = get_parameter("mavlink_map_yaw_deg").as_double();
+        cfg.position_variance = get_parameter("mavlink_position_variance").as_double();
+        cfg.angle_variance = get_parameter("mavlink_angle_variance").as_double();
+        cfg.confidence = get_parameter("mavlink_confidence").as_double();
+        mavlink_worker_ = std::make_unique<MavlinkWorker>(this, cfg);
+        RCLCPP_INFO(get_logger(), "MAVLink vision waits for camera-to-base TF before sending");
+    }
+
     // ── SLAM Worker ────────────────────────────────────────────────────────────
     if (slam_enabled_) {
         auto pub_pose  = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -211,6 +241,11 @@ void PassiveStereoNode::init()
         slam_cfg.clahe_enabled   = enable_clahe_val;
         slam_cfg.trace_path      = get_parameter("slam_trace_path").as_string();
 
+        if (mavlink_worker_) {
+            slam_cfg.vision_sink = [this](VisionSample sample) {
+                mavlink_worker_->push(std::move(sample));
+            };
+        }
         slam_worker_ = std::make_unique<SlamWorker>(
             this, pub_pose, pub_cloud, pub_path, slam_cfg);
         slam_worker_->start();

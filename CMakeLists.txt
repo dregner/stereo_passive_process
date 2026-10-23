@@ -11,6 +11,7 @@ endif()
 # ---- ROS 2 packages -------------------------------------------------------
 find_package(ament_cmake    REQUIRED)
 find_package(rclcpp         REQUIRED)
+find_package(libmavconn     REQUIRED)
 find_package(sensor_msgs    REQUIRED)
 find_package(geometry_msgs  REQUIRED)
 find_package(nav_msgs       REQUIRED)
@@ -123,6 +124,7 @@ set(SOURCES
   src/gpio_trigger.cpp
   src/spinnaker_grabber.cpp
   src/slam_worker.cpp
+  src/mavlink_worker.cpp
   src/disparity_worker.cpp
   src/preview_worker.cpp
   src/passive_stereo_node.cpp
@@ -147,6 +149,7 @@ target_include_directories(passive_stereo_node
 )
 
 ament_target_dependencies(passive_stereo_node
+  libmavconn
   rclcpp
   sensor_msgs
   geometry_msgs

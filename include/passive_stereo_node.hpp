@@ -15,6 +15,7 @@
 #include "spinnaker_grabber.hpp"
 #include "stereo_calib.hpp"
 #include "slam_worker.hpp"
+#include "mavlink_worker.hpp"
 #include "disparity_worker.hpp"
 #include "preview_worker.hpp"
 #include "gpio_trigger.hpp"
@@ -47,6 +48,7 @@ private:
     // ── Workers ────────────────────────────────────────────────────────────────
     std::unique_ptr<SpinnakerGrabber>  grabber_;
     std::unique_ptr<StereoCalib>       calib_;
+    std::unique_ptr<MavlinkWorker>     mavlink_worker_;
     std::unique_ptr<SlamWorker>        slam_worker_;
     std::unique_ptr<DisparityWorker>   disp_worker_;
     std::unique_ptr<PreviewWorker>     prev_worker_;

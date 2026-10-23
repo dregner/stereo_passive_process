@@ -5,6 +5,8 @@
 #include <memory>
 #include <string>
 #include <chrono>
+#include <functional>
+#include "mavlink_vision.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -52,6 +54,7 @@ public:
         double clahe_clip{2.0};
         int    clahe_tiles{8};
         bool   clahe_enabled{false};
+        std::function<void(VisionSample)> vision_sink;
         std::string trace_path; ///< Optional tracking timing/state CSV
     };
 
@@ -112,6 +115,8 @@ private:
     tf2::Transform initial_offset_;
     bool tf_cached_{false};
     bool initial_offset_set_{false};
+    uint64_t vision_epoch_{0};
+    bool vision_tracking_{false};
 
     nav_msgs::msg::Path path_msg_;
 

@@ -156,6 +156,17 @@ void SlamWorker::publishPose(
         msg->pose.covariance.fill(-1.0);
     }
 
+    if (cfg_.vision_sink && tf_cached_ && cfg_.enu_publish && stamp.nanoseconds() > 0) {
+        VisionSample sample;
+        sample.usec = static_cast<uint64_t>(stamp.nanoseconds() / 1000);
+        const auto & p = T_zeroed.getOrigin();
+        const auto q = T_zeroed.getRotation();
+        sample.position = Eigen::Vector3d(p.x(), p.y(), p.z());
+        sample.orientation = Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z());
+        sample.epoch = vision_epoch_;
+        cfg_.vision_sink(std::move(sample));
+    }
+
     if (pub_pose_) {
         pub_pose_->publish(*msg);
     }
@@ -235,6 +246,7 @@ void SlamWorker::run()
             slam_->Reset();
             slam_->ResetActiveMap();
             initial_offset_set_ = false;
+            ++vision_epoch_;
             path_msg_.poses.clear();
             RCLCPP_INFO(node_->get_logger(), "SlamWorker: SLAM reset applied");
         }
@@ -267,7 +279,10 @@ void SlamWorker::run()
         last_tracking_state_.store(state);
         processed_frames_++;
 
-        if (state == 2 || state == 5) {
+        const bool tracking = state == 2 || state == 5;
+        if (!tracking && vision_tracking_) ++vision_epoch_;
+        vision_tracking_ = tracking;
+        if (tracking) {
             publishPose(se3, frame->stamp, state);
         }
 
