@@ -18,12 +18,23 @@ PassiveStereoNode::PassiveStereoNode(const rclcpp::NodeOptions & options)
 : rclcpp::Node("passive_stereo_node", options)
 {
     declareParameters();
-    init();
+    try { init(); }
+    catch (...) {
+        stopPipeline();
+        throw;
+    }
 }
 
 PassiveStereoNode::~PassiveStereoNode()
 {
-    // 1. Stop grabber first
+    stopPipeline();
+}
+
+void PassiveStereoNode::stopPipeline()
+{
+    // Stop trigger outputs before tearing down acquisition.
+    if (pwm_trigger_) pwm_trigger_->stop();
+    if (gpio_trigger_) gpio_trigger_->stop();
     if (grabber_) grabber_->stop();
 
     // 2. Drain and stop preprocess thread
@@ -32,7 +43,6 @@ PassiveStereoNode::~PassiveStereoNode()
     if (preprocess_thread_.joinable()) preprocess_thread_.join();
 
     // 3. Stop workers
-    if (gpio_trigger_) gpio_trigger_->stop();
     if (slam_worker_)  slam_worker_->stop();
     if (mavlink_worker_) mavlink_worker_->stop();
     if (disp_worker_)  disp_worker_->stop();
@@ -58,7 +68,10 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("trigger_delay_us",   29);
     declare_parameter("trigger_source", std::string("Line3"));
     declare_parameter("trigger_activation", std::string("RisingEdge"));
-    declare_parameter("trigger_generator", std::string("gpio")); // gpio | external (standalone PWM)
+    declare_parameter("trigger_generator", std::string("gpio")); // gpio | pwm | external
+    declare_parameter("pwm_chip", std::string("/sys/class/pwm/pwmchip2"));
+    declare_parameter("pwm_channel", 0);
+    declare_parameter("pwm_duty_cycle_percent", 50.0);
     declare_parameter("max_consec_errors",  10);
     declare_parameter("sync_tolerance_ms",  0.0);
 
@@ -159,8 +172,17 @@ void PassiveStereoNode::init()
     }
 
     const auto trigger_generator = get_parameter("trigger_generator").as_string();
-    if (trigger_generator != "gpio" && trigger_generator != "external")
-        throw std::invalid_argument("trigger_generator must be gpio or external");
+    if (trigger_generator != "gpio" && trigger_generator != "pwm" && trigger_generator != "external")
+        throw std::invalid_argument("trigger_generator must be gpio, pwm or external");
+    if (get_parameter("trigger_mode").as_bool() && trigger_generator == "pwm") {
+        const auto channel = get_parameter("pwm_channel").as_int();
+        if (channel < 0 || channel > 2147483647)
+            throw std::invalid_argument("pwm_channel must be a nonnegative 32-bit integer");
+        pwm_trigger_ = std::make_unique<PwmTrigger>(
+            get_parameter("pwm_chip").as_string(), static_cast<int>(channel),
+            get_parameter("frame_rate").as_double(),
+            get_parameter("pwm_duty_cycle_percent").as_double());
+    }
     const auto color_backend = get_parameter("color_conversion_backend").as_string();
     if (color_backend != "cpu" && color_backend != "cuda")
         throw std::invalid_argument("color_conversion_backend must be cpu or cuda");
@@ -364,7 +386,15 @@ void PassiveStereoNode::init()
     });
     grabber_->start();
 
-    // ── GPIO Trigger (started AFTER cameras are fully armed!) ─────────────────
+    // Trigger outputs start only AFTER both cameras are armed.
+    if (pwm_trigger_) {
+        pwm_trigger_->start();
+        RCLCPP_INFO(get_logger(), "Hardware PWM trigger started: %s/pwm%ld @%.3f Hz, %.3f%% duty",
+            get_parameter("pwm_chip").as_string().c_str(),
+            static_cast<long>(get_parameter("pwm_channel").as_int()),
+            get_parameter("frame_rate").as_double(),
+            get_parameter("pwm_duty_cycle_percent").as_double());
+    }
     if (trigger_enabled_ && trigger_generator == "gpio") {
         std::string chip = get_parameter("gpio_chip").as_string();
         int line         = get_parameter("gpio_line").as_int();

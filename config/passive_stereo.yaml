@@ -25,7 +25,10 @@ passive_stereo_node:
     trigger_activation: RisingEdge
     max_consec_errors: 10
     sync_tolerance_ms: 25.0
-    trigger_generator: gpio
+    trigger_generator: pwm  # pwm: hardware peripheral; gpio: software timing; external: no generator
+    pwm_chip: /sys/class/pwm/pwmchip2  # Verify device mapping on the Jetson; PWM5 / pin 33
+    pwm_channel: 0
+    pwm_duty_cycle_percent: 50.0  # Independent of camera exposure_time
     gpio_chip: gpiochip0
     gpio_line: 144
 

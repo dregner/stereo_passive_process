@@ -122,6 +122,7 @@ endif()
 set(SOURCES
   src/stereo_calib.cpp
   src/gpio_trigger.cpp
+  src/pwm_trigger.cpp
   src/spinnaker_grabber.cpp
   src/slam_worker.cpp
   src/mavlink_worker.cpp
@@ -224,5 +225,12 @@ set_target_properties(passive_stereo_node PROPERTIES
 install(TARGETS passive_stereo_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config  DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY launch  DESTINATION share/${PROJECT_NAME})
+
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(pwm_trigger_test validation/pwm_trigger_test.cpp src/pwm_trigger.cpp)
+  target_include_directories(pwm_trigger_test PRIVATE include)
+  add_test(NAME pwm_trigger_test COMMAND pwm_trigger_test)
+endif()
 
 ament_package()

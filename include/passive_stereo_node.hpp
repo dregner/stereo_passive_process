@@ -19,6 +19,7 @@
 #include "disparity_worker.hpp"
 #include "preview_worker.hpp"
 #include "gpio_trigger.hpp"
+#include "pwm_trigger.hpp"
 #include "clahe_processor.hpp"
 #include "bounded_queue.hpp"
 
@@ -41,6 +42,7 @@ private:
     void onStereoFrame(const RawFrame & left, const RawFrame & right);
     void preprocessThread();
     void reportTimerCallback();
+    void stopPipeline();
 
     void onSlamReset(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
                      std::shared_ptr<std_srvs::srv::Trigger::Response> res);
@@ -53,6 +55,7 @@ private:
     std::unique_ptr<DisparityWorker>   disp_worker_;
     std::unique_ptr<PreviewWorker>     prev_worker_;
     std::unique_ptr<GpioTrigger>       gpio_trigger_;
+    std::unique_ptr<PwmTrigger>        pwm_trigger_;
 
     bool color_correction_enabled_{false};
     cv::Matx33f color_ccm_left_{cv::Matx33f::eye()};
