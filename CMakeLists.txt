@@ -11,7 +11,14 @@ endif()
 # ---- ROS 2 packages -------------------------------------------------------
 find_package(ament_cmake    REQUIRED)
 find_package(rclcpp         REQUIRED)
-find_package(libmavconn     REQUIRED)
+# Standalone generated C headers (c_library_v2), no MAVROS/libmavconn dependency.
+find_path(MAVLINK_INCLUDE_DIR ardupilotmega/mavlink.h
+  HINTS ENV MAVLINK_INCLUDE_DIR
+  PATH_SUFFIXES mavlink/v2.0 mavlink c_library_v2)
+if(NOT MAVLINK_INCLUDE_DIR)
+  message(FATAL_ERROR "MAVLink C headers missing: set MAVLINK_INCLUDE_DIR to c_library_v2")
+endif()
+find_package(Threads REQUIRED)
 find_package(sensor_msgs    REQUIRED)
 find_package(geometry_msgs  REQUIRED)
 find_package(nav_msgs       REQUIRED)
@@ -81,9 +88,8 @@ if(NOT EXISTS "${ORB_SLAM3_ROOT}/include/System.h")
   message(FATAL_ERROR "ORB-SLAM3 not found at ${ORB_SLAM3_ROOT}")
 endif()
 
-# Find Eigen3, Sophus and Pangolin (required by ORB-SLAM3)
+# Find Eigen3 and Sophus (required by ORB-SLAM3)
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
-find_package(Pangolin REQUIRED)
 find_package(Sophus QUIET)
 if(NOT Sophus_FOUND)
   # Fallback: use ORB-SLAM3 bundled Thirdparty
@@ -126,6 +132,7 @@ set(SOURCES
   src/spinnaker_grabber.cpp
   src/slam_worker.cpp
   src/mavlink_worker.cpp
+  src/mavlink_transport.cpp
   src/disparity_worker.cpp
   src/preview_worker.cpp
   src/passive_stereo_node.cpp
@@ -133,6 +140,8 @@ set(SOURCES
 )
 
 add_executable(passive_stereo_node ${SOURCES})
+target_include_directories(passive_stereo_node SYSTEM PRIVATE ${MAVLINK_INCLUDE_DIR})
+target_link_libraries(passive_stereo_node Threads::Threads)
 
 target_include_directories(passive_stereo_node
   PRIVATE
@@ -143,14 +152,12 @@ target_include_directories(passive_stereo_node
     ${ORB_SLAM3_ROOT}/Thirdparty/Sophus
     ${ORB_SLAM3_ROOT}/Thirdparty/DBoW2
     ${ORB_SLAM3_ROOT}/Thirdparty/g2o
-    ${Pangolin_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
     ${GPIOD_INCLUDE_DIRS}
     /usr/local/cuda/include
 )
 
 ament_target_dependencies(passive_stereo_node
-  libmavconn
   rclcpp
   sensor_msgs
   geometry_msgs
@@ -168,7 +175,6 @@ target_link_libraries(passive_stereo_node
   ORB_SLAM3::ORB_SLAM3
   retinify
   CUDA::cudart
-  ${Pangolin_LIBRARIES}
   ${GPIOD_LIBRARIES}
   ${OpenCV_LIBS}
   Eigen3::Eigen
@@ -179,39 +185,15 @@ target_link_libraries(passive_stereo_node
 # Ensure installed binary finds non-system libraries:
 # 1. ORB-SLAM3 and thirdparty libs (DBoW2, g2o)
 # 2. Spinnaker SDK
-# 3. Pangolin (found either in system, /usr/local/lib, or ORB-SLAM3/Thirdparty/Pangolin/build)
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 set(RPATH_DIRS
   "${ORB_SLAM3_ROOT}/lib"
   "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib"
   "${ORB_SLAM3_ROOT}/Thirdparty/g2o/lib"
-  "${ORB_SLAM3_ROOT}/Thirdparty/Pangolin/build"
   "${SPINNAKER_ROOT}/lib"
   "/usr/local/lib"
 )
-
-if(DEFINED Pangolin_DIR)
-  get_filename_component(_pango_dir "${Pangolin_DIR}" DIRECTORY)
-  list(APPEND RPATH_DIRS "${Pangolin_DIR}" "${_pango_dir}" "${_pango_dir}/lib")
-endif()
-
-# Check each library in Pangolin_LIBRARIES
-foreach(_p_lib IN LISTS Pangolin_LIBRARIES)
-  if(TARGET "${_p_lib}")
-    get_target_property(_loc "${_p_lib}" IMPORTED_LOCATION_RELEASE)
-    if(NOT _loc)
-      get_target_property(_loc "${_p_lib}" IMPORTED_LOCATION)
-    endif()
-    if(_loc)
-      get_filename_component(_d "${_loc}" DIRECTORY)
-      list(APPEND RPATH_DIRS "${_d}")
-    endif()
-  elseif(EXISTS "${_p_lib}")
-    get_filename_component(_d "${_p_lib}" DIRECTORY)
-    list(APPEND RPATH_DIRS "${_d}")
-  endif()
-endforeach()
 
 list(REMOVE_DUPLICATES RPATH_DIRS)
 message(STATUS "passive_stereo_capture RPATH_DIRS: ${RPATH_DIRS}")
@@ -228,6 +210,13 @@ install(DIRECTORY launch  DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   enable_testing()
+  add_executable(mavlink_worker_test validation/mavlink_worker_test.cpp
+    src/mavlink_worker.cpp src/mavlink_transport.cpp)
+  target_include_directories(mavlink_worker_test PRIVATE include)
+  target_include_directories(mavlink_worker_test SYSTEM PRIVATE ${MAVLINK_INCLUDE_DIR})
+  target_link_libraries(mavlink_worker_test Eigen3::Eigen Threads::Threads util)
+  add_test(NAME mavlink_worker_test COMMAND mavlink_worker_test)
+  set_tests_properties(mavlink_worker_test PROPERTIES TIMEOUT 10)
   add_executable(pwm_trigger_test validation/pwm_trigger_test.cpp src/pwm_trigger.cpp)
   target_include_directories(pwm_trigger_test PRIVATE include)
   add_test(NAME pwm_trigger_test COMMAND pwm_trigger_test)

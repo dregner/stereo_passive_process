@@ -2,8 +2,9 @@
 
 #include <atomic>
 #include <thread>
-#include <rclcpp/rclcpp.hpp>
-#include <mavconn/interface.hpp>
+#include <functional>
+#include <memory>
+#include "mavlink_transport.hpp"
 #include "bounded_queue.hpp"
 #include "mavlink_vision.hpp"
 
@@ -23,15 +24,18 @@ public:
         double angle_variance{0.1};
         double confidence{100.0};
     };
-    MavlinkWorker(rclcpp::Node * node, const Config & cfg);
+    using Clock = std::function<uint64_t()>;  // Microseconds, same clock as VisionSample.
+    using ErrorSink = std::function<void(const std::string &)>;
+    explicit MavlinkWorker(const Config & cfg, Clock clock = {}, ErrorSink errors = {});
     ~MavlinkWorker();
     void push(VisionSample sample);
     void stop();
 private:
     void run();
-    rclcpp::Node * node_;
+    Clock clock_;
+    ErrorSink errors_;
     Config cfg_;
-    mavconn::MAVConnInterface::Ptr bridge_;
+    std::unique_ptr<MavlinkTransport> bridge_;
     BoundedQueue<VisionSample> queue_{1, true};
     std::atomic<bool> running_{true};
     std::thread thread_;

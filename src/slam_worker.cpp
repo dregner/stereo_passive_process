@@ -36,7 +36,7 @@ SlamWorker::SlamWorker(
         cfg_.voc_file,
         cfg_.settings_file,
         ORB_SLAM3::System::STEREO,
-        cfg_.use_pangolin));
+        false));  // Run without the ORB-SLAM3 viewer.
 
     path_msg_.header.frame_id = cfg_.frame_id;
 

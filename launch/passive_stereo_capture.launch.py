@@ -23,7 +23,7 @@ def generate_launch_description():
         DeclareLaunchArgument('disparity', default_value='false', description='Enable Disparity'),
 
         DeclareLaunchArgument('mavlink_enabled', default_value='false',  description='Open the MAVLink bridge inside the capture process'),
-        DeclareLaunchArgument('mavlink_bridge_url', default_value='udp://:14555@127.0.0.1:14550', description='libmavconn UDP, TCP or serial connection URL'),
+        DeclareLaunchArgument('mavlink_bridge_url', default_value='udp://:14555@127.0.0.1:14550', description='Direct UDP, TCP or serial connection URL'),
         DeclareLaunchArgument('mavlink_message', default_value='estimate', choices=['estimate', 'delta'], description='Vision MAVLink message type'),
 
         Node(

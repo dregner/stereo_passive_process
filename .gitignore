@@ -1,0 +1,8 @@
+/tests/
+/docs/
+/tools/
+/color_calib/
+stereo_pairs/
+/config/
+/validation/
+COLCON_IGNORE

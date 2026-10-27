@@ -17,11 +17,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2/LinearMath/Transform.h>
 
-// Prevent Pangolin Xlib collision with ROS headers
-#pragma push_macro("None")
-#undef None
 #include <System.h>
-#pragma pop_macro("None")
 
 #include <sophus/se3.hpp>
 #include <opencv2/imgproc.hpp>
@@ -43,7 +39,6 @@ public:
     struct Config {
         std::string voc_file;
         std::string settings_file;
-        bool use_pangolin{false};
         double scale_factor{1.0};
         std::string frame_id{"map"};
         std::string parent_frame_id{"base_link"};

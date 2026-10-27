@@ -91,7 +91,6 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("slam_enabled",       true);
     declare_parameter("slam_voc_file",       std::string(""));
     declare_parameter("slam_settings_file",  std::string(""));
-    declare_parameter("slam_use_pangolin",   false);
     declare_parameter("slam_scale_factor",   1.0);
     declare_parameter("slam_enu_publish",    true);
     declare_parameter("slam_tf_publish",     false);
@@ -234,7 +233,12 @@ void PassiveStereoNode::init()
         cfg.position_variance = get_parameter("mavlink_position_variance").as_double();
         cfg.angle_variance = get_parameter("mavlink_angle_variance").as_double();
         cfg.confidence = get_parameter("mavlink_confidence").as_double();
-        mavlink_worker_ = std::make_unique<MavlinkWorker>(this, cfg);
+        mavlink_worker_ = std::make_unique<MavlinkWorker>(cfg,
+            [this] { return static_cast<uint64_t>(now().nanoseconds() / 1000); },
+            [this](const std::string & error) {
+                RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "Direct MAVLink send failed: %s", error.c_str());
+            });
         RCLCPP_INFO(get_logger(), "MAVLink vision waits for camera-to-base TF before sending");
     }
 
@@ -250,7 +254,6 @@ void PassiveStereoNode::init()
         SlamWorker::Config slam_cfg;
         slam_cfg.voc_file        = get_parameter("slam_voc_file").as_string();
         slam_cfg.settings_file   = get_parameter("slam_settings_file").as_string();
-        slam_cfg.use_pangolin    = get_parameter("slam_use_pangolin").as_bool();
         slam_cfg.scale_factor    = get_parameter("slam_scale_factor").as_double();
         slam_cfg.frame_id        = get_parameter("frame_id").as_string();
         slam_cfg.parent_frame_id = get_parameter("parent_frame_id").as_string();

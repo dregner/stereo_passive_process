@@ -3,11 +3,12 @@
 #include <cmath>
 #include <stdexcept>
 #include <numbers>
+#include <ardupilotmega/mavlink.h>
 
 namespace passive_stereo_capture
 {
-MavlinkWorker::MavlinkWorker(rclcpp::Node * node, const Config & cfg)
-: node_(node), cfg_(cfg)
+MavlinkWorker::MavlinkWorker(const Config & cfg, Clock clock, ErrorSink errors)
+: clock_(std::move(clock)), errors_(std::move(errors)), cfg_(cfg)
 {
     if (cfg.message != "estimate" && cfg.message != "delta")
         throw std::invalid_argument("mavlink_message must be estimate or delta");
@@ -18,10 +19,12 @@ MavlinkWorker::MavlinkWorker(rclcpp::Node * node, const Config & cfg)
         cfg.position_variance <= 0 || !std::isfinite(cfg.angle_variance) || cfg.angle_variance <= 0 ||
         !std::isfinite(cfg.confidence) || cfg.confidence <= 0 || cfg.confidence > 100)
         throw std::invalid_argument("Invalid MAVLink URL, timing, alignment, uncertainty or confidence");
-    bridge_ = mavconn::MAVConnInterface::open_url(cfg.bridge_url, cfg.system_id, cfg.component_id);
-    bridge_->set_protocol_version(mavconn::Protocol::V20);
+    if (!clock_) clock_ = [] {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    };
+    bridge_ = std::make_unique<MavlinkTransport>(cfg.bridge_url);
     thread_ = std::thread(&MavlinkWorker::run, this);
-    RCLCPP_INFO(node_->get_logger(), "MAVLink %s worker opened %s", cfg.message.c_str(), cfg.bridge_url.c_str());
 }
 
 MavlinkWorker::~MavlinkWorker() { stop(); }
@@ -38,6 +41,7 @@ void MavlinkWorker::stop()
 
 void MavlinkWorker::run()
 {
+    mavlink_status_t tx_status{};  // Private sequence state, MAVLink 2 by default.
     VisionSample previous;
     bool have_previous = false;
     uint8_t reset_counter = 0;
@@ -52,9 +56,8 @@ void MavlinkWorker::run()
             have_previous = false;
             continue;
         }
-        // Receipt age is checked against ROS time; do not transmit a stale queue item.
-        const auto now_ns = node_->now().nanoseconds();
-        const double age = static_cast<double>(now_ns) / 1e9 - sample.usec / 1e6;
+        const auto now_usec = clock_();
+        const double age = static_cast<double>(now_usec) / 1e6 - sample.usec / 1e6;
         if (age < 0 || age > cfg_.max_gap_sec) {
             if (have_previous) ++reset_counter;
             have_previous = false;
@@ -65,10 +68,14 @@ void MavlinkWorker::run()
              (sample.usec - previous.usec) / 1e6 > cfg_.max_gap_sec);
         if (discontinuity) { ++reset_counter; have_previous = false; }
         try {
-            if (!bridge_->is_open()) throw std::runtime_error("MAVLink bridge connection closed");
+            auto send = [&](const mavlink_message_t & packet) {
+                uint8_t bytes[MAVLINK_MAX_PACKET_LEN];
+                const auto size = mavlink_msg_to_send_buffer(bytes, &packet);
+                bridge_->send(bytes, size);
+            };
             const auto rotation = visionRotation(sample, yaw);
             if (cfg_.message == "estimate") {
-                mavlink::common::msg::VISION_POSITION_ESTIMATE msg{};
+                mavlink_vision_position_estimate_t msg{};
                 msg.usec = sample.usec;
                 const auto p = visionPosition(sample, yaw);
                 msg.x = p.x(); msg.y = p.y(); msg.z = 0;
@@ -78,9 +85,12 @@ void MavlinkWorker::run()
                 msg.covariance[11] = cfg_.position_variance;  // Disable Z fusion in EK3 sources.
                 msg.covariance[15] = msg.covariance[18] = msg.covariance[20] = cfg_.angle_variance;
                 msg.reset_counter = reset_counter;
-                bridge_->send_message(msg);
+                mavlink_message_t packet{};
+                mavlink_msg_vision_position_estimate_encode_status(
+                    cfg_.system_id, cfg_.component_id, &tx_status, &packet, &msg);
+                send(packet);
             } else if (have_previous) {
-                mavlink::ardupilotmega::msg::VISION_POSITION_DELTA msg{};
+                mavlink_vision_position_delta_t msg{};
                 msg.time_usec = sample.usec;
                 msg.time_delta_usec = sample.usec - previous.usec;
                 const Eigen::Vector3d dp = rotation.transpose() *
@@ -92,7 +102,10 @@ void MavlinkWorker::run()
                     msg.angle_delta[i] = dr[i];
                 }
                 msg.confidence = cfg_.confidence;
-                bridge_->send_message(msg);
+                mavlink_message_t packet{};
+                mavlink_msg_vision_position_delta_encode_status(
+                    cfg_.system_id, cfg_.component_id, &tx_status, &packet, &msg);
+                send(packet);
             }
             previous = sample;
             have_previous = true;
@@ -100,8 +113,7 @@ void MavlinkWorker::run()
             // Never bridge across a failed send with an unreported delta.
             have_previous = false;
             ++reset_counter;
-            RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-                "MAVLink vision send failed: %s", ex.what());
+            if (errors_) errors_(ex.what());
         }
     }
 }
