@@ -453,7 +453,7 @@ void PassiveStereoNode::reportTimerCallback()
     }
 
     ss << " | ColorDropped=" << preprocess_queue_.dropped();
-    RCLCPP_DEBUG(get_logger(), "%s", ss.str().c_str());
+    RCLCPP_INFO(get_logger(), "%s", ss.str().c_str());
 }
 
 void PassiveStereoNode::onStereoFrame(

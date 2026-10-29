@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -59,20 +60,53 @@ void PwmTrigger::start()
         // Allow sysfs creation and udev permission rules to finish after export.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         bool ready = false;
+        std::string unavailable;
         do {
             ready = true;
-            for (const auto * name : {"period", "duty_cycle", "polarity", "enable"})
-                ready = ready && (::access((channel_path_ + "/" + name).c_str(), W_OK) == 0);
+            unavailable.clear();
+            for (const auto * name : {"period", "duty_cycle", "enable"}) {
+                if (::access((channel_path_ + "/" + name).c_str(), W_OK) != 0) {
+                    const int error = errno;
+                    ready = false;
+                    unavailable += std::string(" ") + name + " (" + std::strerror(error) + ")";
+                }
+            }
+            // Some permission rules expose polarity read-only. No write is
+            // needed if the fresh channel already has the required polarity.
+            std::string polarity;
+            std::ifstream(channel_path_ + "/polarity") >> polarity;
+            if (polarity != "normal" &&
+                ::access((channel_path_ + "/polarity").c_str(), W_OK) != 0) {
+                const int error = errno;
+                ready = false;
+                unavailable += std::string(" polarity (requires normal or write access: ") +
+                               std::strerror(error) + ")";
+            }
             if (ready) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         } while (std::chrono::steady_clock::now() < deadline);
         if (!ready)
             throw std::runtime_error("PWM controls did not become writable: " + channel_path_ +
+                                     "; unavailable:" + unavailable +
                                      "; configure sysfs/udev permissions for the capture user");
-        // A fresh Tegra export has period zero: configure it before disabling.
+        // Unexport can retain the old period and duty. Clear that duty before
+        // shortening the period, otherwise the kernel rejects duty > period.
+        // A fresh Tegra channel has period zero and rejects even zero-duty
+        // writes, so it needs the opposite order.
+        uint64_t previous_period = 0;
+        if (!(std::ifstream(channel_path_ + "/period") >> previous_period))
+            throw std::runtime_error("PWM: cannot read current period: " + channel_path_);
+        if (previous_period > 0) {
+            period_configured_ = true;
+            write(channel_path_ + "/duty_cycle", "0");
+            write(channel_path_ + "/enable", "0");
+        }
         write(channel_path_ + "/period", std::to_string(period_ns_));
+        period_configured_ = true;
         write(channel_path_ + "/duty_cycle", "0");
-        write(channel_path_ + "/polarity", "normal");
+        std::string polarity;
+        std::ifstream(channel_path_ + "/polarity") >> polarity;
+        if (polarity != "normal") write(channel_path_ + "/polarity", "normal");
         write(channel_path_ + "/duty_cycle", std::to_string(duty_ns_));
         write(channel_path_ + "/enable", "1");
         enabled_ = true;
@@ -85,14 +119,19 @@ void PwmTrigger::start()
 void PwmTrigger::stop() noexcept
 {
     if (!owned_) return;
-    for (const auto * name : {"duty_cycle", "enable"}) {
-        try { write(channel_path_ + "/" + name, "0"); }
-        catch (const std::exception & e) { std::cerr << e.what() << '\n'; }
+    // Before a valid period is set, no output was enabled by this owner.
+    // Tegra can reject even zero duty/disable writes while the period is zero.
+    if (period_configured_) {
+        for (const auto * name : {"duty_cycle", "enable"}) {
+            try { write(channel_path_ + "/" + name, "0"); }
+            catch (const std::exception & e) { std::cerr << e.what() << '\n'; }
+        }
     }
     enabled_ = false;
     try {
         write(chip_ + "/unexport", std::to_string(channel_));
         owned_ = false;
+        period_configured_ = false;
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; }
 }
 

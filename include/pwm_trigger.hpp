@@ -24,6 +24,7 @@ private:
     uint64_t period_ns_;
     uint64_t duty_ns_;
     bool owned_{false};
+    bool period_configured_{false};
     bool enabled_{false};
 };
 
