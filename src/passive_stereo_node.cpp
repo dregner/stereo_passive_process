@@ -18,12 +18,23 @@ PassiveStereoNode::PassiveStereoNode(const rclcpp::NodeOptions & options)
 : rclcpp::Node("passive_stereo_node", options)
 {
     declareParameters();
-    init();
+    try { init(); }
+    catch (...) {
+        stopPipeline();
+        throw;
+    }
 }
 
 PassiveStereoNode::~PassiveStereoNode()
 {
-    // 1. Stop grabber first
+    stopPipeline();
+}
+
+void PassiveStereoNode::stopPipeline()
+{
+    // Stop trigger outputs before tearing down acquisition.
+    if (pwm_trigger_) pwm_trigger_->stop();
+    if (gpio_trigger_) gpio_trigger_->stop();
     if (grabber_) grabber_->stop();
 
     // 2. Drain and stop preprocess thread
@@ -32,8 +43,8 @@ PassiveStereoNode::~PassiveStereoNode()
     if (preprocess_thread_.joinable()) preprocess_thread_.join();
 
     // 3. Stop workers
-    if (gpio_trigger_) gpio_trigger_->stop();
     if (slam_worker_)  slam_worker_->stop();
+    if (mavlink_worker_) mavlink_worker_->stop();
     if (disp_worker_)  disp_worker_->stop();
     if (prev_worker_)  prev_worker_->stop();
 }
@@ -57,7 +68,10 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("trigger_delay_us",   29);
     declare_parameter("trigger_source", std::string("Line3"));
     declare_parameter("trigger_activation", std::string("RisingEdge"));
-    declare_parameter("trigger_generator", std::string("gpio")); // gpio | external (standalone PWM)
+    declare_parameter("trigger_generator", std::string("gpio")); // gpio | pwm | external
+    declare_parameter("pwm_chip", std::string("/sys/class/pwm/pwmchip2"));
+    declare_parameter("pwm_channel", 0);
+    declare_parameter("pwm_duty_cycle_percent", 50.0);
     declare_parameter("max_consec_errors",  10);
     declare_parameter("sync_tolerance_ms",  0.0);
 
@@ -77,11 +91,12 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("slam_enabled",       true);
     declare_parameter("slam_voc_file",       std::string(""));
     declare_parameter("slam_settings_file",  std::string(""));
-    declare_parameter("slam_use_pangolin",   false);
     declare_parameter("slam_scale_factor",   1.0);
     declare_parameter("slam_enu_publish",    true);
     declare_parameter("slam_tf_publish",     false);
     declare_parameter("slam_cloud_hz",       2.0);
+    declare_parameter("slam_publish_tracked_image", false);
+    declare_parameter("slam_tracked_image_hz", 10.0);
     declare_parameter("frame_id",            std::string("map"));
     declare_parameter("parent_frame_id",     std::string("base_link"));
     declare_parameter("child_frame_id",      std::string("Passive/left_camera_link"));
@@ -123,6 +138,18 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("depth_height",        0);
     declare_parameter("disp_image_hz",       10.0);
 
+    // MAVLink: opening a connection is opt-in, independent of preview/depth.
+    declare_parameter("mavlink_enabled", false);
+    declare_parameter("mavlink_bridge_url", std::string("udp://:14555@127.0.0.1:14550"));
+    declare_parameter("mavlink_message", std::string("estimate"));
+    declare_parameter("mavlink_system_id", 1);
+    declare_parameter("mavlink_component_id", 197);
+    declare_parameter("mavlink_max_gap_sec", 0.5);
+    declare_parameter("mavlink_map_yaw_deg", 0.0);
+    declare_parameter("mavlink_position_variance", 0.05);
+    declare_parameter("mavlink_angle_variance", 0.1);
+    declare_parameter("mavlink_confidence", 100.0);
+
     // Preview
     declare_parameter("preview_enabled",  true);
     declare_parameter("preview_width",    612);
@@ -146,8 +173,17 @@ void PassiveStereoNode::init()
     }
 
     const auto trigger_generator = get_parameter("trigger_generator").as_string();
-    if (trigger_generator != "gpio" && trigger_generator != "external")
-        throw std::invalid_argument("trigger_generator must be gpio or external");
+    if (trigger_generator != "gpio" && trigger_generator != "pwm" && trigger_generator != "external")
+        throw std::invalid_argument("trigger_generator must be gpio, pwm or external");
+    if (get_parameter("trigger_mode").as_bool() && trigger_generator == "pwm") {
+        const auto channel = get_parameter("pwm_channel").as_int();
+        if (channel < 0 || channel > 2147483647)
+            throw std::invalid_argument("pwm_channel must be a nonnegative 32-bit integer");
+        pwm_trigger_ = std::make_unique<PwmTrigger>(
+            get_parameter("pwm_chip").as_string(), static_cast<int>(channel),
+            get_parameter("frame_rate").as_double(),
+            get_parameter("pwm_duty_cycle_percent").as_double());
+    }
     const auto color_backend = get_parameter("color_conversion_backend").as_string();
     if (color_backend != "cpu" && color_backend != "cuda")
         throw std::invalid_argument("color_conversion_backend must be cpu or cuda");
@@ -186,6 +222,28 @@ void PassiveStereoNode::init()
     double clahe_clip_val = get_parameter("clahe_clip_limit").as_double();
     bool enable_clahe_val = get_parameter("enable_clahe").as_bool();
 
+    if (get_parameter("mavlink_enabled").as_bool()) {
+        if (!slam_enabled_ || !get_parameter("slam_enu_publish").as_bool())
+            throw std::invalid_argument("MAVLink requires slam_enabled and slam_enu_publish");
+        MavlinkWorker::Config cfg;
+        cfg.bridge_url = get_parameter("mavlink_bridge_url").as_string();
+        cfg.message = get_parameter("mavlink_message").as_string();
+        cfg.system_id = get_parameter("mavlink_system_id").as_int();
+        cfg.component_id = get_parameter("mavlink_component_id").as_int();
+        cfg.max_gap_sec = get_parameter("mavlink_max_gap_sec").as_double();
+        cfg.map_yaw_deg = get_parameter("mavlink_map_yaw_deg").as_double();
+        cfg.position_variance = get_parameter("mavlink_position_variance").as_double();
+        cfg.angle_variance = get_parameter("mavlink_angle_variance").as_double();
+        cfg.confidence = get_parameter("mavlink_confidence").as_double();
+        mavlink_worker_ = std::make_unique<MavlinkWorker>(cfg,
+            [this] { return static_cast<uint64_t>(now().nanoseconds() / 1000); },
+            [this](const std::string & error) {
+                RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "Direct MAVLink send failed: %s", error.c_str());
+            });
+        RCLCPP_INFO(get_logger(), "MAVLink vision waits for camera-to-base TF before sending");
+    }
+
     // ── SLAM Worker ────────────────────────────────────────────────────────────
     if (slam_enabled_) {
         auto pub_pose  = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -194,11 +252,18 @@ void PassiveStereoNode::init()
             mk("slam/pointcloud"), sensor_qos);
         auto pub_path  = create_publisher<nav_msgs::msg::Path>(
             mk("slam/path"), 10);
+        SlamWorker::ImagePub pub_tracked_image;
+        if (get_parameter("slam_publish_tracked_image").as_bool()) {
+            const double hz = get_parameter("slam_tracked_image_hz").as_double();
+            if (!std::isfinite(hz) || hz <= 0.0)
+                throw std::invalid_argument("slam_tracked_image_hz must be finite and positive");
+            pub_tracked_image = create_publisher<sensor_msgs::msg::CompressedImage>(
+                mk("slam/tracked/image/compressed"), sensor_qos);
+        }
 
         SlamWorker::Config slam_cfg;
         slam_cfg.voc_file        = get_parameter("slam_voc_file").as_string();
         slam_cfg.settings_file   = get_parameter("slam_settings_file").as_string();
-        slam_cfg.use_pangolin    = get_parameter("slam_use_pangolin").as_bool();
         slam_cfg.scale_factor    = get_parameter("slam_scale_factor").as_double();
         slam_cfg.frame_id        = get_parameter("frame_id").as_string();
         slam_cfg.parent_frame_id = get_parameter("parent_frame_id").as_string();
@@ -206,13 +271,19 @@ void PassiveStereoNode::init()
         slam_cfg.enu_publish     = get_parameter("slam_enu_publish").as_bool();
         slam_cfg.tf_publish      = get_parameter("slam_tf_publish").as_bool();
         slam_cfg.cloud_pub_hz    = get_parameter("slam_cloud_hz").as_double();
+        slam_cfg.tracked_image_hz = get_parameter("slam_tracked_image_hz").as_double();
         slam_cfg.clahe_clip      = clahe_clip_val;
         slam_cfg.clahe_tiles     = clahe_tiles_val;
         slam_cfg.clahe_enabled   = enable_clahe_val;
         slam_cfg.trace_path      = get_parameter("slam_trace_path").as_string();
 
+        if (mavlink_worker_) {
+            slam_cfg.vision_sink = [this](VisionSample sample) {
+                mavlink_worker_->push(std::move(sample));
+            };
+        }
         slam_worker_ = std::make_unique<SlamWorker>(
-            this, pub_pose, pub_cloud, pub_path, slam_cfg);
+            this, pub_pose, pub_cloud, pub_path, slam_cfg, pub_tracked_image);
         slam_worker_->start();
         RCLCPP_INFO(get_logger(), "SLAM worker started");
 
@@ -329,7 +400,15 @@ void PassiveStereoNode::init()
     });
     grabber_->start();
 
-    // ── GPIO Trigger (started AFTER cameras are fully armed!) ─────────────────
+    // Trigger outputs start only AFTER both cameras are armed.
+    if (pwm_trigger_) {
+        pwm_trigger_->start();
+        RCLCPP_INFO(get_logger(), "Hardware PWM trigger started: %s/pwm%ld @%.3f Hz, %.3f%% duty",
+            get_parameter("pwm_chip").as_string().c_str(),
+            static_cast<long>(get_parameter("pwm_channel").as_int()),
+            get_parameter("frame_rate").as_double(),
+            get_parameter("pwm_duty_cycle_percent").as_double());
+    }
     if (trigger_enabled_ && trigger_generator == "gpio") {
         std::string chip = get_parameter("gpio_chip").as_string();
         int line         = get_parameter("gpio_line").as_int();
@@ -343,7 +422,7 @@ void PassiveStereoNode::init()
     }
 
     report_timer_ = create_wall_timer(
-        std::chrono::seconds(2),
+        std::chrono::seconds(10),
         std::bind(&PassiveStereoNode::reportTimerCallback, this));
 
     RCLCPP_INFO(get_logger(),
@@ -385,7 +464,7 @@ void PassiveStereoNode::reportTimerCallback()
     }
 
     ss << " | ColorDropped=" << preprocess_queue_.dropped();
-    RCLCPP_DEBUG(get_logger(), "%s", ss.str().c_str());
+    RCLCPP_INFO(get_logger(), "%s", ss.str().c_str());
 }
 
 void PassiveStereoNode::onStereoFrame(

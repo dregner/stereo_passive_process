@@ -20,6 +20,8 @@ if [[ ${1:-} == --help ]]; then
     echo "SSH preview defaults: 1280 pixels wide, 10 FPS, windowed."
     echo "Overrides: STEREO_GUI_PREVIEW_WIDTH, STEREO_GUI_PREVIEW_FPS,"
     echo "           STEREO_GUI_FULLSCREEN (0 or 1). Width 0 preserves native preview."
+    echo "Build: CMake, C++17, OpenCV HighGUI, yaml-cpp, and Spinnaker are required."
+    echo "Set OpenCV_DIR to the directory containing OpenCVConfig.cmake if needed."
     exit 0
 fi
 if [[ -z ${DISPLAY:-} ]]; then
@@ -36,17 +38,34 @@ if [[ -n ${SSH_CONNECTION:-} || -n ${SSH_TTY:-} ]]; then
     export STEREO_GUI_FULLSCREEN="${STEREO_GUI_FULLSCREEN:-0}"
 fi
 build_dir="${STEREO_GUI_BUILD_DIR:-/tmp/passive_stereo_gui_${UID}}"
-mkdir -p "$build_dir"
+mkdir -p "$build_dir/cmake-source"
 binary="$build_dir/stereo_camera_gui"
-source_checksum="$(cksum < "$script_dir/stereo_camera_gui.cpp")"
-cached_checksum="$(cat "$binary.source-checksum" 2>/dev/null || true)"
-if [[ ! -x "$binary" || "$source_checksum" != "$cached_checksum" ]]; then
-    echo "Compiling stereo GUI from $script_dir/stereo_camera_gui.cpp"
-    c++ -std=c++17 -O2 "$script_dir/stereo_camera_gui.cpp" -o "$binary" \
-        -I/opt/spinnaker/include -L/opt/spinnaker/lib -Wl,-rpath,/opt/spinnaker/lib \
-        $(pkg-config --cflags --libs opencv4 yaml-cpp) -lSpinnaker -pthread
-    printf '%s\n' "$source_checksum" > "$binary.source-checksum"
+# Source installations of OpenCV often provide CMake metadata but no .pc file.
+cat > "$build_dir/cmake-source/CMakeLists.txt" <<'CMAKE'
+cmake_minimum_required(VERSION 3.18)
+project(stereo_camera_gui LANGUAGES CXX)
+find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc imgcodecs highgui)
+find_package(yaml-cpp REQUIRED)
+find_package(Threads REQUIRED)
+find_path(SPINNAKER_INCLUDE_DIR Spinnaker.h HINTS /opt/spinnaker/include REQUIRED)
+find_library(SPINNAKER_LIBRARY Spinnaker HINTS /opt/spinnaker/lib REQUIRED)
+add_executable(stereo_camera_gui "${STEREO_GUI_SOURCE_FILE}")
+target_compile_features(stereo_camera_gui PRIVATE cxx_std_17)
+target_include_directories(stereo_camera_gui PRIVATE ${OpenCV_INCLUDE_DIRS} "${SPINNAKER_INCLUDE_DIR}")
+if(TARGET yaml-cpp::yaml-cpp)
+    set(YAML_TARGET yaml-cpp::yaml-cpp)
+else()
+    set(YAML_TARGET yaml-cpp)
+endif()
+target_link_libraries(stereo_camera_gui PRIVATE ${OpenCV_LIBS} ${YAML_TARGET} "${SPINNAKER_LIBRARY}" Threads::Threads)
+message(STATUS "Stereo GUI uses OpenCV ${OpenCV_VERSION} from ${OpenCV_DIR}")
+CMAKE
+cmake_args=(-DCMAKE_BUILD_TYPE=Release "-DSTEREO_GUI_SOURCE_FILE=$script_dir/stereo_camera_gui.cpp")
+if [[ -n ${OpenCV_DIR:-} ]]; then
+    cmake_args+=("-DOpenCV_DIR=$OpenCV_DIR")
 fi
+cmake -S "$build_dir/cmake-source" -B "$build_dir" "${cmake_args[@]}"
+cmake --build "$build_dir" --target stereo_camera_gui
 if [[ ${1:-} == --check-display ]]; then
     exec "$binary" --check-display
 fi

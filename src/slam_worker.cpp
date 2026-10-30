@@ -1,6 +1,7 @@
 #include "slam_worker.hpp"
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <fstream>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -21,11 +22,13 @@ SlamWorker::SlamWorker(
     PosePub  pub_pose,
     CloudPub pub_cloud,
     PathPub  pub_path,
-    const Config & cfg)
+    const Config & cfg,
+    ImagePub pub_tracked_image)
 : node_(node),
   pub_pose_(std::move(pub_pose)),
   pub_cloud_(std::move(pub_cloud)),
   pub_path_(std::move(pub_path)),
+  pub_tracked_image_(std::move(pub_tracked_image)),
   cfg_(cfg)
 {
     tf_buffer_      = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
@@ -36,7 +39,7 @@ SlamWorker::SlamWorker(
         cfg_.voc_file,
         cfg_.settings_file,
         ORB_SLAM3::System::STEREO,
-        cfg_.use_pangolin));
+        false));  // Run without the ORB-SLAM3 viewer.
 
     path_msg_.header.frame_id = cfg_.frame_id;
 
@@ -156,6 +159,17 @@ void SlamWorker::publishPose(
         msg->pose.covariance.fill(-1.0);
     }
 
+    if (cfg_.vision_sink && tf_cached_ && cfg_.enu_publish && stamp.nanoseconds() > 0) {
+        VisionSample sample;
+        sample.usec = static_cast<uint64_t>(stamp.nanoseconds() / 1000);
+        const auto & p = T_zeroed.getOrigin();
+        const auto q = T_zeroed.getRotation();
+        sample.position = Eigen::Vector3d(p.x(), p.y(), p.z());
+        sample.orientation = Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z());
+        sample.epoch = vision_epoch_;
+        cfg_.vision_sink(std::move(sample));
+    }
+
     if (pub_pose_) {
         pub_pose_->publish(*msg);
     }
@@ -186,8 +200,11 @@ void SlamWorker::publishCloud(const rclcpp::Time & stamp)
         if (!p || p->isBad()) continue;
         Eigen::Vector3f wp = p->GetWorldPos();
         tf2::Vector3 pt_orb(wp(0), wp(1), wp(2));
-        tf2::Vector3 pt_ros = kOrbToRosEnu * pt_orb;
-        if (tf_cached_) pt_ros = pt_ros + T_base_cam_.getOrigin();
+         tf2::Vector3 pt_ros = cfg_.enu_publish ? kOrbToRosEnu * pt_orb : pt_orb;
+        // Map points already live in ORB's world frame. Apply the same world-axis
+        // conversion and initial-origin shift as publishPose(). The camera/base
+        // extrinsic changes the reported body pose, not world-point coordinates.
+        if (initial_offset_set_) pt_ros = initial_offset_.inverse() * pt_ros;
         valid_pts.push_back({static_cast<float>(pt_ros.x()),
                              static_cast<float>(pt_ros.y()),
                              static_cast<float>(pt_ros.z())});
@@ -216,6 +233,29 @@ void SlamWorker::publishCloud(const rclcpp::Time & stamp)
     pub_cloud_->publish(std::move(cloud));
 }
 
+void SlamWorker::publishTrackedImage(const rclcpp::Time & stamp)
+{
+    if (!pub_tracked_image_ || pub_tracked_image_->get_subscription_count() == 0) return;
+    if (!tracked_image_limiter_.ready(stamp.seconds(), cfg_.tracked_image_hz)) return;
+
+    // ORB's drawer uses the actual tracking image (including internal rectification
+    // and resizing) and excludes outliers. Raw input pixels can be misaligned.
+    try {
+        const cv::Mat image = slam_->GetTrackingImage();
+        if (image.empty()) return;
+        sensor_msgs::msg::CompressedImage msg;
+        msg.header.stamp = stamp;
+        msg.header.frame_id = cfg_.child_frame_id;
+        msg.format = "bgr8; jpeg compressed bgr8";
+        if (cv::imencode(".jpg", image, msg.data, {cv::IMWRITE_JPEG_QUALITY, 80})) {
+            pub_tracked_image_->publish(std::move(msg));
+        }
+    } catch (const cv::Exception & ex) {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+            "SLAM tracked image encoding failed: %s", ex.what());
+    }
+}
+
 void SlamWorker::run()
 {
     std::ofstream trace;
@@ -235,6 +275,7 @@ void SlamWorker::run()
             slam_->Reset();
             slam_->ResetActiveMap();
             initial_offset_set_ = false;
+            ++vision_epoch_;
             path_msg_.poses.clear();
             RCLCPP_INFO(node_->get_logger(), "SlamWorker: SLAM reset applied");
         }
@@ -266,8 +307,12 @@ void SlamWorker::run()
         int state = slam_->GetTrackingState();
         last_tracking_state_.store(state);
         processed_frames_++;
+        publishTrackedImage(frame->stamp);
 
-        if (state == 2 || state == 5) {
+        const bool tracking = state == 2 || state == 5;
+        if (!tracking && vision_tracking_) ++vision_epoch_;
+        vision_tracking_ = tracking;
+        if (tracking) {
             publishPose(se3, frame->stamp, state);
         }
 

@@ -15,18 +15,16 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'calibration_file',
             default_value= PathJoinSubstitution([FindPackageShare('passive_stereo_capture'),
-                                                  'config', 'stereo_calibration_lab.yaml']),
+                                                  'config', 'stereo_calibration_bfs.yaml']),
             description='Path to the OpenCV stereo calibration YAML'),
 
-        DeclareLaunchArgument(
-            'slam',
-            default_value='false',
-            description='Enable SLAM'),
-        
-        DeclareLaunchArgument(
-            'disparity',
-            default_value='false',
-            description='Enable Disparity'),
+        DeclareLaunchArgument('slam', default_value='false', description='Enable SLAM'),
+
+        DeclareLaunchArgument('disparity', default_value='false', description='Enable Disparity'),
+
+        DeclareLaunchArgument('mavlink_enabled', default_value='false',  description='Open the MAVLink bridge inside the capture process'),
+        DeclareLaunchArgument('mavlink_bridge_url', default_value="udp://0.0.0.0:0@150.162.167.10:14771", description='Direct UDP, TCP or serial connection URL'),
+        DeclareLaunchArgument('mavlink_message', default_value='estimate', choices=['estimate', 'delta'], description='Vision MAVLink message type'),
 
         Node(
             package='passive_stereo_capture',
@@ -36,9 +34,12 @@ def generate_launch_description():
             parameters=[
                 LaunchConfiguration('params_file'),
                 {
-                    'calibration_file': LaunchConfiguration('calibration_file'),
+                    # 'calibration_file': LaunchConfiguration('calibration_file'),
                     'slam_enabled': LaunchConfiguration('slam'),
-                    'disparity_enabled': LaunchConfiguration('disparity')
+                    'disparity_enabled': LaunchConfiguration('disparity'),
+                    'mavlink_enabled': LaunchConfiguration('mavlink_enabled'),
+                    'mavlink_bridge_url': LaunchConfiguration('mavlink_bridge_url'),
+                    'mavlink_message': LaunchConfiguration('mavlink_message')
                 }
             ],
         ),

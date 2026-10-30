@@ -5,21 +5,20 @@
 #include <memory>
 #include <string>
 #include <chrono>
+#include <functional>
+#include "mavlink_vision.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <tf2/LinearMath/Transform.h>
 
-// Prevent Pangolin Xlib collision with ROS headers
-#pragma push_macro("None")
-#undef None
 #include <System.h>
-#pragma pop_macro("None")
 
 #include <sophus/se3.hpp>
 #include <opencv2/imgproc.hpp>
@@ -27,6 +26,7 @@
 #include "stereo_frame.hpp"
 #include "bounded_queue.hpp"
 #include "worker_metrics.hpp"
+#include "rate_limiter.hpp"
 
 namespace passive_stereo_capture
 {
@@ -41,7 +41,6 @@ public:
     struct Config {
         std::string voc_file;
         std::string settings_file;
-        bool use_pangolin{false};
         double scale_factor{1.0};
         std::string frame_id{"map"};
         std::string parent_frame_id{"base_link"};
@@ -49,22 +48,26 @@ public:
         bool enu_publish{true};
         bool tf_publish{false};
         double cloud_pub_hz{2.0};
+        double tracked_image_hz{10.0};
         double clahe_clip{2.0};
         int    clahe_tiles{8};
         bool   clahe_enabled{false};
+        std::function<void(VisionSample)> vision_sink;
         std::string trace_path; ///< Optional tracking timing/state CSV
     };
 
     using PosePub   = rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr;
     using CloudPub  = rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr;
     using PathPub   = rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr;
+    using ImagePub  = rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr;
 
     SlamWorker(
         rclcpp::Node * node,
         PosePub  pub_pose,
         CloudPub pub_cloud,
         PathPub  pub_path,
-        const Config & cfg);
+        const Config & cfg,
+        ImagePub pub_tracked_image = nullptr);
 
     ~SlamWorker();
 
@@ -86,6 +89,7 @@ private:
     void run();
     void publishPose(const Sophus::SE3f & se3, const rclcpp::Time & stamp, int tracking_state);
     void publishCloud(const rclcpp::Time & stamp);
+    void publishTrackedImage(const rclcpp::Time & stamp);
     tf2::Transform sophusToTf(const Sophus::SE3f & pose);
     void tryLookupTf();
 
@@ -95,6 +99,8 @@ private:
     PosePub  pub_pose_;
     CloudPub pub_cloud_;
     PathPub  pub_path_;
+    ImagePub pub_tracked_image_;
+    RateLimiter tracked_image_limiter_;
     Config   cfg_;
 
     std::shared_ptr<tf2_ros::Buffer>               tf_buffer_;
@@ -112,6 +118,8 @@ private:
     tf2::Transform initial_offset_;
     bool tf_cached_{false};
     bool initial_offset_set_{false};
+    uint64_t vision_epoch_{0};
+    bool vision_tracking_{false};
 
     nav_msgs::msg::Path path_msg_;
 
