@@ -9,7 +9,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'params_file',
-            default_value='/home/jetson/ros2_ws/src/stereo_passive_process/config/passive_stereo.yaml',
+            default_value='/home/jetson/ros2_ws/src/stereo_passive_process/config/passive_stereo_lab.yaml',
             description='Path to the passive_stereo YAML parameter file'),
 
         DeclareLaunchArgument(
@@ -23,7 +23,7 @@ def generate_launch_description():
         DeclareLaunchArgument('disparity', default_value='false', description='Enable Disparity'),
 
         DeclareLaunchArgument('mavlink_enabled', default_value='false',  description='Open the MAVLink bridge inside the capture process'),
-        DeclareLaunchArgument('mavlink_bridge_url', default_value='udpin:150.162.167.129:14770', description='Direct UDP, TCP or serial connection URL'),
+        DeclareLaunchArgument('mavlink_bridge_url', default_value="udp://0.0.0.0:0@150.162.167.10:14771", description='Direct UDP, TCP or serial connection URL'),
         DeclareLaunchArgument('mavlink_message', default_value='estimate', choices=['estimate', 'delta'], description='Vision MAVLink message type'),
 
         Node(

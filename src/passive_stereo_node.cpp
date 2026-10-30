@@ -422,7 +422,7 @@ void PassiveStereoNode::init()
     }
 
     report_timer_ = create_wall_timer(
-        std::chrono::seconds(2),
+        std::chrono::seconds(10),
         std::bind(&PassiveStereoNode::reportTimerCallback, this));
 
     RCLCPP_INFO(get_logger(),
