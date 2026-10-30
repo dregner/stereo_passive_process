@@ -12,6 +12,7 @@
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
@@ -25,6 +26,7 @@
 #include "stereo_frame.hpp"
 #include "bounded_queue.hpp"
 #include "worker_metrics.hpp"
+#include "rate_limiter.hpp"
 
 namespace passive_stereo_capture
 {
@@ -46,6 +48,7 @@ public:
         bool enu_publish{true};
         bool tf_publish{false};
         double cloud_pub_hz{2.0};
+        double tracked_image_hz{10.0};
         double clahe_clip{2.0};
         int    clahe_tiles{8};
         bool   clahe_enabled{false};
@@ -56,13 +59,15 @@ public:
     using PosePub   = rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr;
     using CloudPub  = rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr;
     using PathPub   = rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr;
+    using ImagePub  = rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr;
 
     SlamWorker(
         rclcpp::Node * node,
         PosePub  pub_pose,
         CloudPub pub_cloud,
         PathPub  pub_path,
-        const Config & cfg);
+        const Config & cfg,
+        ImagePub pub_tracked_image = nullptr);
 
     ~SlamWorker();
 
@@ -84,6 +89,7 @@ private:
     void run();
     void publishPose(const Sophus::SE3f & se3, const rclcpp::Time & stamp, int tracking_state);
     void publishCloud(const rclcpp::Time & stamp);
+    void publishTrackedImage(const rclcpp::Time & stamp);
     tf2::Transform sophusToTf(const Sophus::SE3f & pose);
     void tryLookupTf();
 
@@ -93,6 +99,8 @@ private:
     PosePub  pub_pose_;
     CloudPub pub_cloud_;
     PathPub  pub_path_;
+    ImagePub pub_tracked_image_;
+    RateLimiter tracked_image_limiter_;
     Config   cfg_;
 
     std::shared_ptr<tf2_ros::Buffer>               tf_buffer_;

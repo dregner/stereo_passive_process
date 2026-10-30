@@ -95,6 +95,8 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("slam_enu_publish",    true);
     declare_parameter("slam_tf_publish",     false);
     declare_parameter("slam_cloud_hz",       2.0);
+    declare_parameter("slam_publish_tracked_image", false);
+    declare_parameter("slam_tracked_image_hz", 10.0);
     declare_parameter("frame_id",            std::string("map"));
     declare_parameter("parent_frame_id",     std::string("base_link"));
     declare_parameter("child_frame_id",      std::string("Passive/left_camera_link"));
@@ -250,6 +252,14 @@ void PassiveStereoNode::init()
             mk("slam/pointcloud"), sensor_qos);
         auto pub_path  = create_publisher<nav_msgs::msg::Path>(
             mk("slam/path"), 10);
+        SlamWorker::ImagePub pub_tracked_image;
+        if (get_parameter("slam_publish_tracked_image").as_bool()) {
+            const double hz = get_parameter("slam_tracked_image_hz").as_double();
+            if (!std::isfinite(hz) || hz <= 0.0)
+                throw std::invalid_argument("slam_tracked_image_hz must be finite and positive");
+            pub_tracked_image = create_publisher<sensor_msgs::msg::CompressedImage>(
+                mk("slam/tracked/image/compressed"), sensor_qos);
+        }
 
         SlamWorker::Config slam_cfg;
         slam_cfg.voc_file        = get_parameter("slam_voc_file").as_string();
@@ -261,6 +271,7 @@ void PassiveStereoNode::init()
         slam_cfg.enu_publish     = get_parameter("slam_enu_publish").as_bool();
         slam_cfg.tf_publish      = get_parameter("slam_tf_publish").as_bool();
         slam_cfg.cloud_pub_hz    = get_parameter("slam_cloud_hz").as_double();
+        slam_cfg.tracked_image_hz = get_parameter("slam_tracked_image_hz").as_double();
         slam_cfg.clahe_clip      = clahe_clip_val;
         slam_cfg.clahe_tiles     = clahe_tiles_val;
         slam_cfg.clahe_enabled   = enable_clahe_val;
@@ -272,7 +283,7 @@ void PassiveStereoNode::init()
             };
         }
         slam_worker_ = std::make_unique<SlamWorker>(
-            this, pub_pose, pub_cloud, pub_path, slam_cfg);
+            this, pub_pose, pub_cloud, pub_path, slam_cfg, pub_tracked_image);
         slam_worker_->start();
         RCLCPP_INFO(get_logger(), "SLAM worker started");
 
