@@ -32,6 +32,8 @@ passive_stereo_node:
 
     # --- SLAM parameters
     slam_enabled: false
+    slam_publish_tracked_image: false
+    slam_tracked_image_hz: 10.0
     slam_enu_publish: true
     slam_tf_publish: true
     slam_use_pangolin: false
@@ -46,7 +48,7 @@ passive_stereo_node:
     child_frame_id: Passive/left_camera_link
     # --- Disparity parameters
     disparity_enabled: false
-    disp_publish_cloud: true  # compressed color disparity only
+    disp_publish_cloud: true  # dense cloud; compressed disparity is a separate topic
     disparity_rectify_on_cpu: true # Retinify rectifies; OpenCV always rectifies
     disparity_backend: "retinify"  # retinify | stereobm | stereosgbm | stereobinary | cuda_sgm
     depth_mode:       "accurate"   # "fast" | "balanced" | "accurate"
@@ -66,7 +68,8 @@ passive_stereo_node:
     disparity_nice: 5      # Lower CPU priority than tracking on Linux
     depth_width:        0         # 0/0: native; e.g. 1600/1200 or 2448/2048 for load tests
     depth_height:       0
-    disp_cloud_hz:      15.0
+    disp_cloud_hz:      3.0
+    disp_cloud_max_points: 40000  # 0 = no point budget
     disp_image_hz:      10.0
     max_dist:         15.0         # metres; 0 = no limit
     sampling_factor:  0.5         # point cloud decimation (0-1]: 0.5 = every other pixel

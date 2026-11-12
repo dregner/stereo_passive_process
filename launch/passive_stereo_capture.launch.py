@@ -9,7 +9,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'params_file',
-            default_value='/home/jetson/ros2_ws/src/stereo_passive_process/config/passive_stereo.yaml',
+            default_value='/home/jetson/ros2_ws/src/stereo_passive_process/config/passive_stereo_home.yaml',
             description='Path to the passive_stereo YAML parameter file'),
 
         DeclareLaunchArgument(
@@ -43,4 +43,11 @@ def generate_launch_description():
                 }
             ],
         ),
+        Node(
+                package='foxglove_bridge',
+                executable='foxglove_bridge',
+                name='foxglove_bridge',
+                output='screen',
+                ros_arguments=['--log-level', 'WARN'],
+            )
     ])

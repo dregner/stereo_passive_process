@@ -47,6 +47,7 @@ void DisparityWorker::push(StereoFramePtr frame) { queue_.push(std::move(frame))
 void DisparityWorker::start()
 {
     if (running_.load()) return;
+    pub_cloud_.start();
     running_.store(true);
     thread_ = std::thread(&DisparityWorker::run, this);
 }
@@ -56,6 +57,7 @@ void DisparityWorker::stop()
     running_.store(false);
     queue_.shutdown();
     if (thread_.joinable()) thread_.join();
+    pub_cloud_.stop();
 }
 
 bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
@@ -125,7 +127,7 @@ bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
         }
     }
 
-    if (pub_cloud_) {
+    if (pub_cloud_.enabled()) {
         // ── XYZ pinned buffer ─────────────────────────────────────────────────────
         size_t xyz_bytes = static_cast<size_t>(W) * H * 3 * sizeof(float);
         if (pinned_xyz_bytes_ < xyz_bytes) {
@@ -136,11 +138,6 @@ bool DisparityWorker::initPipeline(uint32_t W, uint32_t H)
             }
             pinned_xyz_bytes_ = xyz_bytes;
         }
-
-        size_t pt_size = cfg_.publish_confidence ?
-            sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
-        size_t max_pts = static_cast<size_t>(W) * H;
-        cpu_point_buf_.resize(max_pts * pt_size);
 
         // ── Rectified Left RGB pinned buffer ──────────────────────────────────────
         size_t rect_left_bytes = static_cast<size_t>(W) * H * 3 * sizeof(uint8_t);
@@ -251,9 +248,14 @@ void DisparityWorker::run()
         if (!queue_.pop(frame)) continue;
         // No output consumer: avoid rectification, inference and image enhancement.
         // Capture and SLAM continue independently at their configured rates.
-        if ((!pub_cloud_ || pub_cloud_->get_subscription_count() == 0) &&
-            (!pub_disp_img_ || pub_disp_img_->get_subscription_count() == 0)) continue;
+        const bool has_cloud_sub = pub_cloud_.hasSubscribers();
+        const bool has_img_sub = pub_disp_img_ && pub_disp_img_->get_subscription_count() > 0;
+        if (!has_cloud_sub && !has_img_sub) continue;
         if (cfg_.process_hz > 0.0 && !process_limiter_.ready(frame->stamp.seconds(), cfg_.process_hz)) continue;
+        const double stamp_sec = frame->stamp.seconds();
+        const bool pub_cloud_now = has_cloud_sub && cloud_limiter_.ready(stamp_sec, cfg_.cloud_hz);
+        const bool pub_img_now = has_img_sub && image_limiter_.ready(stamp_sec, cfg_.image_hz);
+        if (!pub_cloud_now && !pub_img_now) continue;
         const auto processing_start = std::chrono::steady_clock::now();
         cv::Mat input_left, input_right;
         if (conventional_ || cfg_.rectify_on_cpu) {
@@ -316,13 +318,6 @@ void DisparityWorker::run()
         processed_frames_++;
         metrics_.record(processing_start, frame->received_at);
 
-        bool has_cloud_sub = (pub_cloud_ && pub_cloud_->get_subscription_count() > 0);
-        bool has_img_sub   = (pub_disp_img_ && pub_disp_img_->get_subscription_count() > 0);
-
-        const double stamp_sec = frame->stamp.seconds();
-        const bool pub_cloud_now = has_cloud_sub && cloud_limiter_.ready(stamp_sec, cfg_.cloud_hz);
-        const bool pub_img_now = has_img_sub && image_limiter_.ready(stamp_sec, cfg_.image_hz);
-
         // Retrieve disparity if needed for pointcloud confidence gating OR for image publishing
         float * disp_ptr = conventional_ ? conventional_disp_.ptr<float>() : h_pinned_disp_ ? h_pinned_disp_ : cpu_disp_buf_.data();
         bool disp_retrieved = static_cast<bool>(conventional_);
@@ -372,8 +367,6 @@ void DisparityWorker::run()
                     continue;
                 }
                 xyz_ptr = conventional_xyz_.ptr<float>();
-                cpu_point_buf_.resize(static_cast<size_t>(W) * H *
-                    (cfg_.publish_confidence ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB)));
             } else {
                 auto pc_status = pipeline_.RetrievePointCloud(
                     h_pinned_xyz_, static_cast<size_t>(W) * 3 * sizeof(float));
@@ -407,6 +400,16 @@ void DisparityWorker::run()
                 static_cast<float>(cfg_.max_dist * cfg_.max_dist) : -1.f;
 
             bool wconf = cfg_.publish_confidence && disp_retrieved;
+            const auto sample_count = [cw, ch](int stride) -> size_t {
+                return ((size_t(cw) + stride - 1) / stride) *
+                       ((size_t(ch) + stride - 1) / stride);
+            };
+            // Increase the stride uniformly across the image to fit the budget.
+            while (cfg_.cloud_max_points > 0 && sample_count(step_px) > cfg_.cloud_max_points) {
+                ++step_px;
+            }
+            const uint32_t pt_step = wconf ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
+            cpu_point_buf_.resize(sample_count(step_px) * pt_step);
 
             size_t valid = compactCloud(
                 xyz_ptr, color_ptr,
@@ -420,7 +423,6 @@ void DisparityWorker::run()
 
             cloud_points = valid;
             if (valid > 0) {
-                uint32_t pt_step = wconf ? sizeof(PointXYZRGBConf) : sizeof(PointXYZRGB);
                 size_t   data_sz = valid * pt_step;
 
                 auto cloud = std::make_unique<sensor_msgs::msg::PointCloud2>();
@@ -452,8 +454,7 @@ void DisparityWorker::run()
                 cloud->data.resize(data_sz);
                 std::memcpy(cloud->data.data(), cpu_point_buf_.data(), data_sz);
 
-                pub_cloud_->publish(std::move(cloud));
-                published_clouds_++;
+                pub_cloud_.push(std::move(cloud));
             } else {
                 empty_clouds_++;
             }

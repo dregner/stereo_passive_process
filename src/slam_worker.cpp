@@ -56,6 +56,8 @@ void SlamWorker::push(StereoFramePtr frame) { queue_.push(std::move(frame)); }
 void SlamWorker::start()
 {
     if (running_.load()) return;
+    pub_cloud_.start();
+    pub_path_.start();
     running_.store(true);
     thread_ = std::thread(&SlamWorker::run, this);
 }
@@ -65,6 +67,8 @@ void SlamWorker::stop()
     running_.store(false);
     queue_.shutdown();
     if (thread_.joinable()) thread_.join();
+    pub_cloud_.stop();
+    pub_path_.stop();
 }
 
 void SlamWorker::reset()
@@ -175,7 +179,7 @@ void SlamWorker::publishPose(
     }
 
     // Accumulate path and publish if subscribed
-    if (pub_path_ && pub_path_->get_subscription_count() > 0) {
+    if (cfg_.path_pub_hz > 0.0 && pub_path_.hasSubscribers()) {
         geometry_msgs::msg::PoseStamped ps;
         ps.header = msg->header;
         ps.pose = msg->pose.pose;
@@ -184,14 +188,14 @@ void SlamWorker::publishPose(
         if (path_msg_.poses.size() > 5000) {
             path_msg_.poses.erase(path_msg_.poses.begin(), path_msg_.poses.begin() + 1000);
         }
-        pub_path_->publish(path_msg_);
+        if (path_limiter_.ready(stamp.seconds(), cfg_.path_pub_hz)) {
+            pub_path_.push(std::make_unique<nav_msgs::msg::Path>(path_msg_));
+        }
     }
 }
 
 void SlamWorker::publishCloud(const rclcpp::Time & stamp)
 {
-    if (!pub_cloud_ || pub_cloud_->get_subscription_count() == 0) return;
-
     auto pts = slam_->GetAllMapPoints();
     std::vector<std::array<float,3>> valid_pts;
     valid_pts.reserve(pts.size());
@@ -230,7 +234,7 @@ void SlamWorker::publishCloud(const rclcpp::Time & stamp)
     cloud->row_step   = 12 * cloud->width;
     cloud->data.resize(cloud->row_step);
     std::memcpy(cloud->data.data(), valid_pts.data(), cloud->row_step);
-    pub_cloud_->publish(std::move(cloud));
+    pub_cloud_.push(std::move(cloud));
 }
 
 void SlamWorker::publishTrackedImage(const rclcpp::Time & stamp)
@@ -318,7 +322,7 @@ void SlamWorker::run()
 
         // Throttle map cloud publishing & check subscriptions
         bool pub_cloud_now = false;
-        if (pub_cloud_ && pub_cloud_->get_subscription_count() > 0) {
+        if (pub_cloud_.hasSubscribers()) {
             if (!last_cloud_pub_init_) {
                 pub_cloud_now = true;
                 last_cloud_pub_init_ = true;

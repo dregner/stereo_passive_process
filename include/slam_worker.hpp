@@ -25,6 +25,7 @@
 
 #include "stereo_frame.hpp"
 #include "bounded_queue.hpp"
+#include "queued_publisher.hpp"
 #include "worker_metrics.hpp"
 #include "rate_limiter.hpp"
 
@@ -48,6 +49,7 @@ public:
         bool enu_publish{true};
         bool tf_publish{false};
         double cloud_pub_hz{2.0};
+        double path_pub_hz{2.0};
         double tracked_image_hz{10.0};
         double clahe_clip{2.0};
         int    clahe_tiles{8};
@@ -82,6 +84,8 @@ public:
     uint64_t processedFrames() const { return processed_frames_.load(); }
 
     uint64_t droppedFrames() const { return queue_.dropped(); }
+    uint64_t droppedClouds() const { return pub_cloud_.dropped(); }
+    uint64_t droppedPaths() const { return pub_path_.dropped(); }
     double processingMs() const { return metrics_.process_ms.load(); }
     double receiptAgeMs() const { return metrics_.receipt_age_ms.load(); }
 
@@ -97,8 +101,8 @@ private:
 
     rclcpp::Node * node_;
     PosePub  pub_pose_;
-    CloudPub pub_cloud_;
-    PathPub  pub_path_;
+    QueuedPublisher<sensor_msgs::msg::PointCloud2> pub_cloud_;
+    QueuedPublisher<nav_msgs::msg::Path> pub_path_;
     ImagePub pub_tracked_image_;
     RateLimiter tracked_image_limiter_;
     Config   cfg_;
@@ -122,6 +126,7 @@ private:
     bool vision_tracking_{false};
 
     nav_msgs::msg::Path path_msg_;
+    RateLimiter path_limiter_;
 
     rclcpp::Time last_cloud_pub_;
     bool         last_cloud_pub_init_{false};

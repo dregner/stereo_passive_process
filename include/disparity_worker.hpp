@@ -17,6 +17,7 @@
 #include "conventional_stereo.hpp"
 #include "stereo_frame.hpp"
 #include "bounded_queue.hpp"
+#include "queued_publisher.hpp"
 #include "rate_limiter.hpp"
 #include "worker_metrics.hpp"
 #include "stereo_calib.hpp"
@@ -47,7 +48,8 @@ public:
         bool   clahe_enabled{false};
         int width{0};                         ///< 0/0 = native; positive pair = software resize
         int height{0};
-        double cloud_hz{15.0};      ///< Max frequency to publish pointcloud
+        double cloud_hz{3.0};       ///< Max frequency to publish pointcloud
+        size_t cloud_max_points{40000};  ///< 0 = no point budget
         double process_hz{10.0};   ///< 0 = every available pair; positive = bound inference work
         int nice{5};              ///< Linux CPU scheduling niceness for background depth work
         bool reproject_on_gpu{false}; ///< Also allow CPU matchers to reproject on CUDA
@@ -73,7 +75,8 @@ public:
 
     uint64_t processedFrames() const { return processed_frames_.load(); }
 
-    uint64_t publishedClouds() const { return published_clouds_.load(); }
+    uint64_t publishedClouds() const { return pub_cloud_.published(); }
+    uint64_t droppedClouds() const { return pub_cloud_.dropped(); }
     uint64_t emptyClouds() const { return empty_clouds_.load(); }
     uint64_t droppedFrames() const { return queue_.dropped(); }
     double processingMs() const { return metrics_.process_ms.load(); }
@@ -97,7 +100,7 @@ private:
 
     void run();
 
-    PointCloud2Pub     pub_cloud_;
+    QueuedPublisher<sensor_msgs::msg::PointCloud2> pub_cloud_;
     CompressedImagePub pub_disp_img_;
 
     Config             cfg_;
@@ -134,7 +137,7 @@ private:
     std::thread       thread_;
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> processed_frames_{0};
-    std::atomic<uint64_t> published_clouds_{0}, empty_clouds_{0};
+    std::atomic<uint64_t> empty_clouds_{0};
 };
 
 }  // namespace passive_stereo_capture
