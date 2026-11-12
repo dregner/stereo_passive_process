@@ -1,6 +1,7 @@
 /tests/
 /docs/
-/tools/
+/tools/*
+!/tools/orb_slam3_tracking_image.patch
 /color_calib/
 stereo_pairs/
 /config/

@@ -95,6 +95,7 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("slam_enu_publish",    true);
     declare_parameter("slam_tf_publish",     false);
     declare_parameter("slam_cloud_hz",       2.0);
+    declare_parameter("slam_path_hz",        2.0);
     declare_parameter("slam_publish_tracked_image", false);
     declare_parameter("slam_tracked_image_hz", 10.0);
     declare_parameter("frame_id",            std::string("map"));
@@ -133,7 +134,8 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("disparity_rectify_on_cpu", false);
     declare_parameter("disparity_trace_path", std::string(""));
     declare_parameter("opencv_threads", 0);
-    declare_parameter("disp_cloud_hz",       15.0);
+    declare_parameter("disp_cloud_hz",       3.0);
+    declare_parameter("disp_cloud_max_points", 40000);
     declare_parameter("depth_width",         0);
     declare_parameter("depth_height",        0);
     declare_parameter("disp_image_hz",       10.0);
@@ -251,7 +253,7 @@ void PassiveStereoNode::init()
         auto pub_cloud = create_publisher<sensor_msgs::msg::PointCloud2>(
             mk("slam/pointcloud"), sensor_qos);
         auto pub_path  = create_publisher<nav_msgs::msg::Path>(
-            mk("slam/path"), 10);
+            mk("slam/path"), 1);
         SlamWorker::ImagePub pub_tracked_image;
         if (get_parameter("slam_publish_tracked_image").as_bool()) {
             const double hz = get_parameter("slam_tracked_image_hz").as_double();
@@ -271,6 +273,9 @@ void PassiveStereoNode::init()
         slam_cfg.enu_publish     = get_parameter("slam_enu_publish").as_bool();
         slam_cfg.tf_publish      = get_parameter("slam_tf_publish").as_bool();
         slam_cfg.cloud_pub_hz    = get_parameter("slam_cloud_hz").as_double();
+        slam_cfg.path_pub_hz     = get_parameter("slam_path_hz").as_double();
+        if (!std::isfinite(slam_cfg.path_pub_hz) || slam_cfg.path_pub_hz < 0.0)
+            throw std::invalid_argument("slam_path_hz must be finite and nonnegative");
         slam_cfg.tracked_image_hz = get_parameter("slam_tracked_image_hz").as_double();
         slam_cfg.clahe_clip      = clahe_clip_val;
         slam_cfg.clahe_tiles     = clahe_tiles_val;
@@ -343,6 +348,10 @@ void PassiveStereoNode::init()
         if (!std::isfinite(disp_cfg.process_hz) || disp_cfg.process_hz < 0)
             throw std::invalid_argument("Depth processing rate must be finite and nonnegative");
         disp_cfg.cloud_hz            = get_parameter("disp_cloud_hz").as_double();
+        const auto max_points = get_parameter("disp_cloud_max_points").as_int();
+        if (max_points < 0)
+            throw std::invalid_argument("disp_cloud_max_points must be nonnegative");
+        disp_cfg.cloud_max_points = static_cast<size_t>(max_points);
         disp_cfg.image_hz            = get_parameter("disp_image_hz").as_double();
 
         disp_worker_ = std::make_unique<DisparityWorker>(pub_cloud, pub_disp_img, *calib_, disp_cfg);
@@ -450,6 +459,7 @@ void PassiveStereoNode::reportTimerCallback()
     if (disp_worker_) {
         ss << " | DispFrames=" << disp_worker_->processedFrames()
            << " clouds=" << disp_worker_->publishedClouds()
+           << " cloud_queue_dropped=" << disp_worker_->droppedClouds()
            << " empty_clouds=" << disp_worker_->emptyClouds()
            << " dropped=" << disp_worker_->droppedFrames()
            << " process_ms=" << disp_worker_->processingMs()
@@ -458,6 +468,8 @@ void PassiveStereoNode::reportTimerCallback()
     if (slam_worker_) {
         ss << " | SlamFrames=" << slam_worker_->processedFrames()
            << " (State: " << slam_worker_->lastTrackingState() << ")"
+           << " cloud_queue_dropped=" << slam_worker_->droppedClouds()
+           << " path_queue_dropped=" << slam_worker_->droppedPaths()
            << " dropped=" << slam_worker_->droppedFrames()
            << " process_ms=" << slam_worker_->processingMs()
            << " receipt_age_ms=" << slam_worker_->receiptAgeMs();

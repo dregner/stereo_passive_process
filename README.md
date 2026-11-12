@@ -63,7 +63,10 @@ stresses depth processing/output; it does not simulate larger-sensor acquisition
 USB traffic, native full-resolution demosaicing, or additional image detail.
 
 `depth_width` / `depth_height` must both be zero (native) or both positive.
-`disp_cloud_hz` defaults to 15 Hz; actual delivery depends on worker throughput.
+`disp_cloud_hz` defaults to 3 Hz; actual delivery depends on worker throughput.
+`disp_cloud_max_points` defaults to 40,000. It increases the sampling stride
+when the cropped grid would exceed that point budget. Set it to `0` to use only
+the configured `sampling_factor` and `crop_factor`.
 Pose is published for every valid tracking result (states OK / OK_KLT), with no
 pose rate limiter. Lost/uninitialized tracking does not publish a fabricated pose.
 
@@ -121,12 +124,34 @@ sudo sysctl -w net.core.wmem_max=26214400
 ```bash
 cd ~/ros2_ws
 source /opt/ros/jazzy/setup.bash
+git -C ~/ORB_SLAM3 apply ~/ros2_ws/src/passive_stereo_capture/tools/orb_slam3_tracking_image.patch
+cmake --build ~/ORB_SLAM3/build --target ORB_SLAM3 -j2
 colcon build --packages-select passive_stereo_capture \
              --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
 > On the Jetson, CUDA architectures `87` and `72` are automatically selected. On x86, `75 80 86 87` are targeted.
+
+Apply the tracking-image patch once to the ORB-SLAM3 directory selected by
+`ORB_SLAM3_ROOT`. It adds an accessor to the existing frame drawer. Its definition
+is in `src/System.cc` to avoid circular header includes; rebuild the ORB-SLAM3
+shared library before building this package. On Jetson, source
+`/opt/ros/humble/setup.bash` when using Humble.
+
+If you already applied the older inline accessor, replace its definition in
+`include/System.h` with `cv::Mat GetTrackingImage();`, then add this definition
+in `src/System.cc` inside `namespace ORB_SLAM3`, before `System::GetTrackingState()`:
+
+```cpp
+cv::Mat System::GetTrackingImage()
+{
+    return mpFrameDrawer->DrawFrame();
+}
+```
+
+Rebuild the ORB-SLAM3 library and this package afterward. Do not reapply the
+full patch on top of the older version.
 
 ---
 
@@ -217,6 +242,22 @@ All parameters live in [`config/passive_stereo.yaml`](config/passive_stereo.yaml
 | `slam_enu_publish` | `true` | Use local FLU (forward/left/up) axes for pose, path and cloud; false retains optical axes |
 | `slam_tf_publish` | `false` | Also broadcast TF transform |
 | `slam_cloud_hz` | `2.0` | Max rate to publish sparse map cloud (Hz) |
+| `slam_publish_tracked_image` | `false` | Publish a JPEG of the SLAM tracking image with tracked points (startup parameter) |
+| `slam_tracked_image_hz` | `10.0` | Maximum tracked image rate; must be finite and positive when enabled |
+
+To view tracked points on the Jetson, start with:
+
+```bash
+/home/jetson/passive_stereo_validated/source/tools/run_jetson.sh \
+  -p slam_publish_tracked_image:=true -p slam_tracked_image_hz:=10.0
+```
+
+Open `/Passive/slam/tracked/image/compressed` in an image viewer such as
+Foxglove. The image comes from ORB-SLAM3's frame drawer, so points align with
+its internally rectified/resized tracking image. Green marks map matches;
+blue marks visual odometry matches. The bottom strip shows tracking status.
+Drawing and JPEG encoding run only when the topic has subscribers. Launch
+users can pass `slam:=true slam_publish_tracked_image:=true` instead.
 
 ### Disparity (Retinify)
 
@@ -277,16 +318,89 @@ ros2 service call /Passive/slam/reset std_srvs/srv/Trigger
 
 ## Published topics
 
+### Simulated stereo cameras
+
+With the simulator and ROS bridge running, launch the Jazzy image pipeline:
+
+```bash
+ros2 launch passive_stereo_capture stereo_image_proc_ipc.launch.py
+ros2 topic hz /Passive/stereo/points2
+```
+
+From a source checkout, you can run
+`ros2 launch ./launch/stereo_image_proc_ipc.launch.py` with the ROS environment
+sourced and `ros-jazzy-image-proc` and `ros-jazzy-stereo-image-proc` installed.
+
+The launch defaults to `/Passive/left/image_raw`, `/Passive/right/image_raw`
+and each camera's `camera_info` topic. Override the inputs with
+`left_image_raw:=...`, `right_image_raw:=...`, `left_camera_info:=...` and
+`right_camera_info:=...`. The container runs image conversion, rectification,
+disparity, and color point-cloud projection with intra-process communication
+enabled between components. Simulator inputs and subscribers outside the
+container use normal ROS transport.
+
+Each camera's image and CameraInfo must share a header timestamp. Use
+`approximate_sync:=true` if the left and right pairs have different timestamps.
+CameraInfo must match the image dimensions and contain stereo calibration,
+including the right projection matrix's baseline term (`p[3] = -fx * baseline`).
+The point-cloud component starts processing when a subscriber connects to
+`/Passive/stereo/points2`. In RViz2, set the fixed frame to the cloud's
+`header.frame_id` or a frame with a TF connection to it.
+
+### Hardware capture
+
 All topics are prefixed with `/Passive/` (configurable via `namespace` parameter).
 
 | Topic | Type | Hz | Description |
 |---|---|---|---|
 | `/Passive/slam/pose_cov` | `PoseWithCovarianceStamped` | 30 | Base/camera pose in the configured map frame |
 | `/Passive/slam/pointcloud` | `PointCloud2` | ≤2 | Sparse ORB-SLAM3 map points |
-| `/Passive/slam/path` | `Path` | 30 | Pose history |
-| `/Passive/disparity/pointcloud` | `PointCloud2` | ≤15 | Dense Retinify depth cloud (XYZRGB[+conf]) |
+| `/Passive/slam/path` | `Path` | ≤2 | Pose history, controlled by `slam_path_hz` (0 disables publishing) |
+| `/Passive/slam/tracked/image/compressed` | `CompressedImage` | ≤10 | Tracking image with green map matches, blue visual odometry matches, and tracking status; enabled by `slam_publish_tracked_image` |
+| `/Passive/disparity/pointcloud` | `PointCloud2` | ≤3 | Dense depth cloud (XYZRGB[+conf]) |
 | `/Passive/left/preview/image/compressed` | `CompressedImage` | ≤10 | Left JPEG preview |
 | `/Passive/right/preview/image/compressed` | `CompressedImage` | ≤10 | Right JPEG preview |
+
+### Record and visualize without flooding the link
+
+Record on the camera host to a local SSD. Start the pipeline and TF publishers
+first so rosbag2 can discover the offered QoS, including the best-effort cloud
+and pose topics and transient-local `/tf_static`. Select only the topics needed
+for replay. For a dense cloud bag with pose and TF, run from the recording volume:
+
+```bash
+ros2 bag record -s mcap -o stereo_run --max-cache-size 33554432 \
+  --topics /Passive/disparity/pointcloud /Passive/slam/pose_cov /tf /tf_static
+```
+
+Use `/Passive/slam/pointcloud` instead if the recording needs the sparse map.
+Run `ros2 bag info stereo_run` after stopping the recorder and check message
+counts. The recorder cache is double-buffered and the limit applies to each
+buffer. A slow SSD can still cause drops when the cache fills.
+
+The default dense budget is up to 0.8 MB per cloud and about 19.2 Mbit/s of
+point data per remote subscriber at 3 Hz with confidence enabled. DDS overhead,
+other streams, and additional consumers increase the total. For live viewing,
+run Foxglove Bridge on the camera host and restrict which streams it exposes:
+
+```bash
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml \
+  "topic_whitelist:=['^/tf(_static)?$', '^/Passive/slam/(pose_cov|pointcloud)$', '^/Passive/left/preview/image/compressed$']"
+```
+
+For RViz2, subscribe to the sparse map or the capped dense cloud with
+**Reliability Policy = Best Effort** and **Depth = 1**. Disable unused image and
+cloud displays. If GigE camera traffic shares the SSH uplink, put the cameras
+on a dedicated interface where possible.
+
+Clouds and the SLAM path each have a dedicated publisher thread with one pending
+message. A slow send can cause the oldest pending message to be replaced.
+`cloud_queue_dropped` and `path_queue_dropped` in the pipeline status count
+these replacements. They do not include DDS or recorder losses. If SSH stalls,
+check the local console for link saturation or NIC drops (`ip -s link`),
+memory pressure or OOM kills (`journalctl -k`), and sustained disk I/O
+(`iostat -xz 1`). Compare a pose/TF-only bag, a local bag with the cloud
+added, and that same bag with a remote GUI connected.
 
 ---
 
@@ -445,7 +559,11 @@ Run without ROS, SLAM, or disparity processing:
 ```
 
 The launcher compiles a small C++ viewer using the installed Spinnaker SDK,
-OpenCV HighGUI, yaml-cpp, and a C++17 compiler. The compiled executable is cached
+OpenCV HighGUI, yaml-cpp, CMake (3.18 or newer), and a C++17 compiler. OpenCV is
+located through its CMake package, so source builds do not need `opencv4.pc`.
+To select a specific installation, run
+`OpenCV_DIR=/usr/local/lib/cmake/opencv4 ./tools/stereo_camera_gui.sh config/passive_stereo_bfs.yaml ~/stereo_capture`.
+The compiled executable is cached
 under `/tmp/passive_stereo_gui_$UID` (override with `STEREO_GUI_BUILD_DIR`).
 Stop other camera acquisition programs before launching it.
 
@@ -648,16 +766,36 @@ take over an already exported channel. The peripheral produces the waveform;
 there is no software pulse-timing thread. The supplied YAML selects hardware PWM
 with 50% duty; the example above demonstrates a shorter light-control pulse.
 Exposure remains `Timed`; duty cycle does not determine camera exposure.
+An unexported channel can retain its previous period and duty in the driver.
+Startup clears retained duty before shortening a nonzero period; a fresh
+zero-period channel is configured with the period first.
 
 Verify the chip's device symlink before use: on the tested setup `pwmchip2/device`
 identifies `32c0000.pwm` (PWM5, pin 33), and `pwmchip3/device` identifies
 `32e0000.pwm` (PWM7, pin 32). Change `pwm_chip` to select pin 32. Clock selection
 and pinmux must already be configured on the Jetson; this code does not modify
 either. The capture user needs write access to `export`, `unexport` and the
-exported channel's `period`, `duty_cycle`, `polarity` and `enable` controls.
+exported channel's `period`, `duty_cycle` and `enable` controls. The node reads
+`polarity` and accepts `normal` without writing it; write access to `polarity`
+is needed only when it must be changed to `normal`.
 Configure permissions with suitable udev rules; one-time chmod on an exported
 channel is lost when it is unexported. The node waits up to two seconds for those
 permissions and fails explicitly if configuration or enable is rejected.
+
+If startup reports `PWM channel already exported`, stop any previous capture
+node or standalone PWM controller first. An exported `pwm0` directory can also
+remain after an interrupted process; its presence alone does not identify an
+active controller. Once no controller is using this channel, release it on the
+Jetson and relaunch:
+
+```bash
+sudo sh -c 'echo 0 > /sys/class/pwm/pwmchip2/pwm0/enable'
+sudo sh -c 'echo 0 > /sys/class/pwm/pwmchip2/unexport'
+ros2 launch passive_stereo_capture passive_stereo_capture.launch.py
+```
+
+Use the chip and channel selected in your YAML. The node deliberately does not
+automatically take over an exported channel.
 
 Other modes remain available: `trigger_generator: gpio` uses software-timed
 libgpiod pulses; `external` arms cameras without generating any pulses. Do not
@@ -783,18 +921,17 @@ capture node supplies the clock and error logging callbacks; the sender can
 also run independently using its default system clock. The capture application
 still uses ROS for parameters, TF, and its other outputs.
 
-Build with the standalone, header-only [MAVLink C library](https://mavlink.io/en/mavgen_c/):
+The required MAVLink C headers are bundled under `third_party/mavlink`, with
+only the two standard vision message definitions. No separate clone, install,
+network download, generator, or `MAVLINK_INCLUDE_DIR` setting is needed.
+Build normally from your ROS workspace:
 
 ```bash
-git clone --depth 1 https://github.com/mavlink/c_library_v2.git /tmp/c_library_v2
-colcon build --packages-select passive_stereo_capture \
-  --cmake-args -DMAVLINK_INCLUDE_DIR=/tmp/c_library_v2
+colcon build --packages-select passive_stereo_capture
 ```
 
-Use a persistent directory for the headers if rebuilding later. CMake also
-searches standard include paths; `MAVLINK_INCLUDE_DIR` must contain
-`ardupilotmega/mavlink.h`. No ROS MAVLink package or linked MAVLink library is
-required. The bridge is closed by default; all parameters below are read at startup.
+ArduPilot, MAVROS and ROS MAVLink packages are not build dependencies. The
+bridge is closed by default; all parameters below are read at startup.
 
 ```bash
 ros2 launch passive_stereo_capture passive_stereo_capture.launch.py \
