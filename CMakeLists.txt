@@ -11,6 +11,7 @@ endif()
 # ---- ROS 2 packages -------------------------------------------------------
 find_package(ament_cmake    REQUIRED)
 find_package(rclcpp         REQUIRED)
+find_package(rclcpp_components REQUIRED)
 # Standalone generated C headers (c_library_v2), no MAVROS/libmavconn dependency.
 find_path(MAVLINK_INCLUDE_DIR ardupilotmega/mavlink.h
   HINTS ENV MAVLINK_INCLUDE_DIR
@@ -30,6 +31,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 # ---- OpenCV ---------------------------------------------------------------
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d
   OPTIONAL_COMPONENTS stereo cudaimgproc cudastereo cudaarithm)
+find_package(JPEG REQUIRED)
 if(OpenCV_cudaimgproc_FOUND AND OpenCV_cudastereo_FOUND AND OpenCV_cudaarithm_FOUND)
   add_compile_definitions(PASSIVE_HAVE_OPENCV_CUDA=1)
   message(STATUS "OpenCV CUDA color conversion, StereoSGM and reprojection enabled")
@@ -132,19 +134,21 @@ set(SOURCES
   src/spinnaker_grabber.cpp
   src/slam_worker.cpp
   src/mavlink_worker.cpp
+  src/mavlink_ekf.cpp
   src/mavlink_transport.cpp
   src/disparity_worker.cpp
   src/preview_worker.cpp
+  src/raw_snapshot.cpp
   src/passive_stereo_node.cpp
-  src/main.cpp
+  src/passive_stereo_component.cpp
 )
 
-add_executable(passive_stereo_node ${SOURCES})
-target_include_directories(passive_stereo_node SYSTEM PRIVATE ${MAVLINK_INCLUDE_DIR})
-target_link_libraries(passive_stereo_node Threads::Threads)
+add_library(passive_stereo_component SHARED ${SOURCES})
+target_include_directories(passive_stereo_component SYSTEM PUBLIC ${MAVLINK_INCLUDE_DIR})
+target_link_libraries(passive_stereo_component Threads::Threads)
 
-target_include_directories(passive_stereo_node
-  PRIVATE
+target_include_directories(passive_stereo_component
+  PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${ORB_SLAM3_ROOT}
     ${ORB_SLAM3_ROOT}/include
@@ -157,8 +161,9 @@ target_include_directories(passive_stereo_node
     /usr/local/cuda/include
 )
 
-ament_target_dependencies(passive_stereo_node
+ament_target_dependencies(passive_stereo_component
   rclcpp
+  rclcpp_components
   sensor_msgs
   geometry_msgs
   nav_msgs
@@ -170,13 +175,14 @@ ament_target_dependencies(passive_stereo_node
 
 find_package(CUDAToolkit REQUIRED)
 
-target_link_libraries(passive_stereo_node
+target_link_libraries(passive_stereo_component
   Spinnaker::Spinnaker
   ORB_SLAM3::ORB_SLAM3
   retinify
   CUDA::cudart
   ${GPIOD_LIBRARIES}
   ${OpenCV_LIBS}
+  JPEG::JPEG
   Eigen3::Eigen
 )
 
@@ -198,12 +204,20 @@ set(RPATH_DIRS
 list(REMOVE_DUPLICATES RPATH_DIRS)
 message(STATUS "passive_stereo_capture RPATH_DIRS: ${RPATH_DIRS}")
 
-set_target_properties(passive_stereo_node PROPERTIES
+set_target_properties(passive_stereo_component PROPERTIES
   INSTALL_RPATH "${RPATH_DIRS}"
   BUILD_WITH_INSTALL_RPATH TRUE
 )
 
+rclcpp_components_register_nodes(passive_stereo_component
+  "passive_stereo_capture::PassiveStereoNode")
+
+add_executable(passive_stereo_node src/main.cpp)
+target_link_libraries(passive_stereo_node passive_stereo_component)
+set_target_properties(passive_stereo_node PROPERTIES INSTALL_RPATH "\$ORIGIN/..")
+
 # ---- Install --------------------------------------------------------------
+install(TARGETS passive_stereo_component LIBRARY DESTINATION lib)
 install(TARGETS passive_stereo_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config  DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY launch  DESTINATION share/${PROJECT_NAME})
@@ -211,7 +225,7 @@ install(DIRECTORY launch  DESTINATION share/${PROJECT_NAME})
 # if(BUILD_TESTING)
 #   enable_testing()
 #   add_executable(mavlink_worker_test validation/mavlink_worker_test.cpp
-#     src/mavlink_worker.cpp src/mavlink_transport.cpp)
+#     src/mavlink_worker.cpp src/mavlink_ekf.cpp src/mavlink_transport.cpp)
 #   target_include_directories(mavlink_worker_test PRIVATE include)
 #   target_include_directories(mavlink_worker_test SYSTEM PRIVATE ${MAVLINK_INCLUDE_DIR})
 #   target_link_libraries(mavlink_worker_test Eigen3::Eigen Threads::Threads util)

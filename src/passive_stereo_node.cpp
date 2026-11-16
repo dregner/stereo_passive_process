@@ -1,4 +1,5 @@
 #include "passive_stereo_node.hpp"
+#include "raw_snapshot.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -151,6 +152,9 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("mavlink_position_variance", 0.05);
     declare_parameter("mavlink_angle_variance", 0.1);
     declare_parameter("mavlink_confidence", 100.0);
+    declare_parameter("slam_ekf_alignment", false);
+    declare_parameter("mavlink_autopilot_system_id", 1);
+    declare_parameter("mavlink_ekf_max_skew_sec", 0.15);
 
     // Preview
     declare_parameter("preview_enabled",  true);
@@ -159,6 +163,7 @@ void PassiveStereoNode::declareParameters()
     declare_parameter("preview_quality",  50);
     declare_parameter("preview_fps",      10.0);
 
+    declare_parameter("raw_image_output_dir", std::string("data"));
     declare_parameter("namespace",        std::string("Passive"));
 }
 
@@ -224,7 +229,9 @@ void PassiveStereoNode::init()
     double clahe_clip_val = get_parameter("clahe_clip_limit").as_double();
     bool enable_clahe_val = get_parameter("enable_clahe").as_bool();
 
-    if (get_parameter("mavlink_enabled").as_bool()) {
+    const bool send_vision = get_parameter("mavlink_enabled").as_bool();
+    const bool align_to_ekf = get_parameter("slam_ekf_alignment").as_bool();
+    if (send_vision || align_to_ekf) {
         if (!slam_enabled_ || !get_parameter("slam_enu_publish").as_bool())
             throw std::invalid_argument("MAVLink requires slam_enabled and slam_enu_publish");
         MavlinkWorker::Config cfg;
@@ -237,13 +244,17 @@ void PassiveStereoNode::init()
         cfg.position_variance = get_parameter("mavlink_position_variance").as_double();
         cfg.angle_variance = get_parameter("mavlink_angle_variance").as_double();
         cfg.confidence = get_parameter("mavlink_confidence").as_double();
+        cfg.receive_ekf = align_to_ekf;
+        cfg.autopilot_system_id = get_parameter("mavlink_autopilot_system_id").as_int();
+        cfg.ekf_max_skew_sec = get_parameter("mavlink_ekf_max_skew_sec").as_double();
         mavlink_worker_ = std::make_unique<MavlinkWorker>(cfg,
             [this] { return static_cast<uint64_t>(now().nanoseconds() / 1000); },
             [this](const std::string & error) {
                 RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
-                    "Direct MAVLink send failed: %s", error.c_str());
+                    "Direct MAVLink I/O failed: %s", error.c_str());
             });
-        RCLCPP_INFO(get_logger(), "MAVLink vision waits for camera-to-base TF before sending");
+        if (send_vision)
+            RCLCPP_INFO(get_logger(), "MAVLink vision waits for camera-to-base TF before sending");
     }
 
     // ── SLAM Worker ────────────────────────────────────────────────────────────
@@ -282,10 +293,13 @@ void PassiveStereoNode::init()
         slam_cfg.clahe_enabled   = enable_clahe_val;
         slam_cfg.trace_path      = get_parameter("slam_trace_path").as_string();
 
-        if (mavlink_worker_) {
+        if (send_vision) {
             slam_cfg.vision_sink = [this](VisionSample sample) {
                 mavlink_worker_->push(std::move(sample));
             };
+        }
+        if (align_to_ekf) {
+            slam_cfg.ekf_pose_at = [this](uint64_t usec) { return mavlink_worker_->ekfPoseAt(usec); };
         }
         slam_worker_ = std::make_unique<SlamWorker>(
             this, pub_pose, pub_cloud, pub_path, slam_cfg, pub_tracked_image);
@@ -430,6 +444,11 @@ void PassiveStereoNode::init()
             chip.c_str(), line, fps);
     }
 
+    save_raw_images_srv_ = create_service<std_srvs::srv::Trigger>(
+        mk("save_raw_images"),
+        std::bind(&PassiveStereoNode::onSaveRawImages, this,
+                  std::placeholders::_1, std::placeholders::_2));
+
     report_timer_ = create_wall_timer(
         std::chrono::seconds(10),
         std::bind(&PassiveStereoNode::reportTimerCallback, this));
@@ -491,6 +510,15 @@ void PassiveStereoNode::onStereoFrame(
     frame->timestamp_ns = left_raw.timestamp_ns;
     frame->timestamp_sec = static_cast<double>(left_raw.timestamp_ns) * 1e-9;
     frame->frame_id = left_raw.frame_id;
+
+    {
+        std::lock_guard lock(raw_snapshot_mutex_);
+        if (raw_snapshot_requested_) {
+            raw_snapshot_ = frame;
+            raw_snapshot_requested_ = false;
+            raw_snapshot_ready_.notify_one();
+        }
+    }
 
     // SLAM never waits for color conversion. Consumers do not modify this frame.
     if (slam_worker_) slam_worker_->push(frame);
@@ -560,6 +588,35 @@ void PassiveStereoNode::onSlamReset(
     if (slam_worker_) slam_worker_->reset();
     res->success = true;
     res->message = "SLAM reset";
+}
+
+void PassiveStereoNode::onSaveRawImages(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+{
+    const auto requested_at = std::chrono::system_clock::now();
+    StereoFramePtr frame;
+    {
+        std::unique_lock lock(raw_snapshot_mutex_);
+        raw_snapshot_requested_ = true;
+        if (!raw_snapshot_ready_.wait_for(lock, std::chrono::seconds(2),
+                [this] { return static_cast<bool>(raw_snapshot_); })) {
+            raw_snapshot_requested_ = false;
+            res->success = false;
+            res->message = "No synchronized stereo pair arrived within 2 seconds";
+            return;
+        }
+        frame = std::move(raw_snapshot_);
+    }
+
+    try {
+        res->message = saveRawSnapshot(get_parameter("raw_image_output_dir").as_string(),
+            requested_at, frame->left_raw, frame->right_raw).string();
+        res->success = true;
+    } catch (const std::exception & e) {
+        res->success = false;
+        res->message = e.what();
+    }
 }
 
 }  // namespace passive_stereo_capture
