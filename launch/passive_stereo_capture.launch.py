@@ -26,6 +26,7 @@ def generate_launch_description():
         DeclareLaunchArgument('mavlink_enabled', default_value='false',  description='Open the MAVLink bridge inside the capture process'),
         DeclareLaunchArgument('mavlink_bridge_url', default_value="udp://0.0.0.0:0@150.162.167.10:14771", description='Direct UDP, TCP or serial connection URL'),
         DeclareLaunchArgument('mavlink_message', default_value='estimate', choices=['estimate', 'delta'], description='Vision MAVLink message type'),
+        DeclareLaunchArgument('slam_ekf_alignment', default_value='false', description='Align ROS SLAM maps to EKF telemetry from the MAVLink endpoint'),
 
         Node(
             package='passive_stereo_capture',
@@ -40,7 +41,8 @@ def generate_launch_description():
                     'disparity_enabled': LaunchConfiguration('disparity'),
                     'mavlink_enabled': LaunchConfiguration('mavlink_enabled'),
                     'mavlink_bridge_url': LaunchConfiguration('mavlink_bridge_url'),
-                    'mavlink_message': LaunchConfiguration('mavlink_message')
+                    'mavlink_message': LaunchConfiguration('mavlink_message'),
+                    'slam_ekf_alignment': LaunchConfiguration('slam_ekf_alignment'),
                 }
             ],
         ),

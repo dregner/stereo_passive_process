@@ -1,4 +1,5 @@
 #include "mavlink_worker.hpp"
+#include "mavlink_ekf.hpp"
 
 #include <cmath>
 #include <stdexcept>
@@ -23,13 +24,24 @@ MavlinkWorker::MavlinkWorker(const Config & cfg, Clock clock, ErrorSink errors)
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
     };
-    bridge_ = std::make_unique<MavlinkTransport>(cfg.bridge_url);
+    if (cfg.receive_ekf) {
+        if (cfg.autopilot_system_id < 1 || cfg.autopilot_system_id > 255 ||
+            !std::isfinite(cfg.ekf_max_skew_sec) || cfg.ekf_max_skew_sec <= 0)
+            throw std::invalid_argument("Invalid MAVLink autopilot system ID or EKF timestamp tolerance");
+        ekf_ = std::make_unique<MavlinkEkf>(cfg);
+    }
+    bridge_ = std::make_unique<MavlinkTransport>(cfg.bridge_url, cfg.receive_ekf);
     thread_ = std::thread(&MavlinkWorker::run, this);
 }
 
 MavlinkWorker::~MavlinkWorker() { stop(); }
 
 void MavlinkWorker::push(VisionSample sample) { queue_.push(std::move(sample)); }
+
+std::optional<Eigen::Isometry3d> MavlinkWorker::ekfPoseAt(uint64_t usec) const
+{
+    return ekf_ ? ekf_->poseAt(usec, clock_()) : std::nullopt;
+}
 
 void MavlinkWorker::stop()
 {
@@ -47,8 +59,16 @@ void MavlinkWorker::run()
     uint8_t reset_counter = 0;
     const double yaw = cfg_.map_yaw_deg * std::numbers::pi / 180.0;
     while (running_.load()) {
+        if (ekf_) {
+            try {
+                ekf_->poll(*bridge_, tx_status, clock_);
+            } catch (const std::exception & ex) {
+                if (errors_) errors_(ex.what());
+            }
+        }
         VisionSample sample;
-        if (!queue_.pop(sample) || !running_.load()) continue;
+        const auto timeout = std::chrono::milliseconds(ekf_ ? 5 : 200);
+        if (!queue_.pop(sample, timeout) || !running_.load()) continue;
         if (sample.usec == 0 || !sample.position.allFinite() ||
             !sample.orientation.coeffs().allFinite() ||
             std::abs(sample.orientation.norm() - 1.0) > 1e-3) {

@@ -3,6 +3,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <fstream>
+#include <mutex>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
@@ -89,8 +90,7 @@ void SlamWorker::tryLookupTf()
             cfg_.parent_frame_id.c_str(), cfg_.child_frame_id.c_str());
     } catch (const tf2::TransformException & ex) {
         RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-            "SlamWorker: TF [%s -> %s] not yet available; publishing pose in "
-            "camera frame until TF arrives: %s",
+            "SlamWorker: waiting for camera-to-base TF [%s -> %s]: %s",
             cfg_.parent_frame_id.c_str(), cfg_.child_frame_id.c_str(), ex.what());
     }
 }
@@ -116,19 +116,56 @@ void SlamWorker::publishPose(
 {
     tf2::Transform T_map_cam = sophusToTf(se3.inverse());
 
-    tf2::Transform T_zeroed = T_map_cam;
+    tf2::Transform T_map_body = T_map_cam;
+    tf2::Transform T_vision = T_map_cam;
     if (tf_cached_) {
-        tf2::Transform T_cam_base = T_base_cam_.inverse();
-        tf2::Transform T_map_base = T_map_cam * T_cam_base;
+        T_map_body = T_map_cam * T_base_cam_.inverse();
 
         if (!initial_offset_set_) {
             initial_offset_.setIdentity();
-            initial_offset_.setOrigin(T_map_base.getOrigin());
-            // initial_offset_ = T_map_base;
+            initial_offset_.setOrigin(T_map_body.getOrigin());
             initial_offset_set_ = true;
         }
-        T_zeroed = initial_offset_.inverse() * T_map_base;
-    } 
+        T_vision = initial_offset_.inverse() * T_map_body;
+    }
+
+    const auto usec = stamp.nanoseconds() / 1000;
+    if (cfg_.vision_sink && tf_cached_ && cfg_.enu_publish && usec > 0) {
+        VisionSample sample;
+        sample.usec = static_cast<uint64_t>(usec);
+        const auto & p = T_vision.getOrigin();
+        const auto q = T_vision.getRotation();
+        sample.position = Eigen::Vector3d(p.x(), p.y(), p.z());
+        sample.orientation = Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z());
+        sample.epoch = vision_epoch_;
+        cfg_.vision_sink(std::move(sample));
+    }
+
+    tf2::Transform T_output = T_vision;
+    if (cfg_.ekf_pose_at) {
+        if (!tf_cached_ || !map_origin_ || usec <= 0) return;
+        auto alignment = map_alignments_.find(*map_origin_);
+        if (alignment == map_alignments_.end()) {
+            const auto pose = cfg_.ekf_pose_at(static_cast<uint64_t>(usec));
+            if (!pose) {
+                RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                    "SlamWorker: map origin %lu awaiting synchronized, healthy MAVLink EKF pose",
+                    *map_origin_);
+                return;
+            }
+            const Eigen::Quaterniond q(pose->linear());
+            const auto p = pose->translation();
+            const tf2::Transform T_enu_body(
+                tf2::Quaternion(q.x(), q.y(), q.z(), q.w()), tf2::Vector3(p.x(), p.y(), p.z()));
+            const auto T_enu_map = T_enu_body * T_map_body.inverse();
+            alignment = map_alignments_.emplace(*map_origin_, T_enu_map).first;
+            const auto & t = T_enu_map.getOrigin();
+            RCLCPP_INFO(node_->get_logger(),
+                "SlamWorker: aligned map origin %lu to EKF ENU (translation %.2f, %.2f, %.2f m)",
+                *map_origin_, t.x(), t.y(), t.z());
+        }
+        T_output = alignment->second * T_map_body;
+    }
     if (cfg_.tf_publish) {
         if(!tf_cached_) {
             RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
@@ -140,14 +177,14 @@ void SlamWorker::publishPose(
         ts.header.stamp    = stamp;
         ts.header.frame_id = cfg_.frame_id;
         ts.child_frame_id  = tf_cached_ ? cfg_.parent_frame_id : cfg_.child_frame_id;
-        tf2::toMsg(T_zeroed, ts.transform);
+        tf2::toMsg(T_output, ts.transform);
         tf_broadcaster_->sendTransform(ts);
     }
 
     auto msg = std::make_unique<geometry_msgs::msg::PoseWithCovarianceStamped>();
     msg->header.stamp    = stamp;
     msg->header.frame_id = cfg_.frame_id;
-    tf2::toMsg(T_zeroed, msg->pose.pose);
+    tf2::toMsg(T_output, msg->pose.pose);
 
     std::fill(msg->pose.covariance.begin(), msg->pose.covariance.end(), 0.0);
     if (state == 2 || state == 5) {
@@ -161,17 +198,6 @@ void SlamWorker::publishPose(
         msg->pose.covariance.fill(1.0);
     } else {
         msg->pose.covariance.fill(-1.0);
-    }
-
-    if (cfg_.vision_sink && tf_cached_ && cfg_.enu_publish && stamp.nanoseconds() > 0) {
-        VisionSample sample;
-        sample.usec = static_cast<uint64_t>(stamp.nanoseconds() / 1000);
-        const auto & p = T_zeroed.getOrigin();
-        const auto q = T_zeroed.getRotation();
-        sample.position = Eigen::Vector3d(p.x(), p.y(), p.z());
-        sample.orientation = Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z());
-        sample.epoch = vision_epoch_;
-        cfg_.vision_sink(std::move(sample));
     }
 
     if (pub_pose_) {
@@ -194,25 +220,35 @@ void SlamWorker::publishPose(
     }
 }
 
-void SlamWorker::publishCloud(const rclcpp::Time & stamp)
+void SlamWorker::publishCloud(const rclcpp::Time & stamp, ORB_SLAM3::Map * map)
 {
+    tf2::Transform T_output_map = tf2::Transform::getIdentity();
+    std::unique_lock<std::mutex> map_lock;
+    if (cfg_.ekf_pose_at) {
+        if (!map || !map_origin_) return;
+        const auto alignment = map_alignments_.find(*map_origin_);
+        if (alignment == map_alignments_.end()) return;
+        map_lock = std::unique_lock(map->mMutexMapUpdate, std::try_to_lock);
+        if (!map_lock || map->GetInitKFid() != *map_origin_) return;
+        T_output_map = alignment->second;
+    } else if (initial_offset_set_) {
+        T_output_map = initial_offset_.inverse();
+    }
     auto pts = slam_->GetAllMapPoints();
     std::vector<std::array<float,3>> valid_pts;
     valid_pts.reserve(pts.size());
 
     for (auto * p : pts) {
-        if (!p || p->isBad()) continue;
+        if (!p || p->isBad() || (map && p->GetMap() != map)) continue;
         Eigen::Vector3f wp = p->GetWorldPos();
         tf2::Vector3 pt_orb(wp(0), wp(1), wp(2));
-         tf2::Vector3 pt_ros = cfg_.enu_publish ? kOrbToRosEnu * pt_orb : pt_orb;
-        // Map points already live in ORB's world frame. Apply the same world-axis
-        // conversion and initial-origin shift as publishPose(). The camera/base
-        // extrinsic changes the reported body pose, not world-point coordinates.
-        if (initial_offset_set_) pt_ros = initial_offset_.inverse() * pt_ros;
+        tf2::Vector3 pt_ros = T_output_map * (cfg_.enu_publish ? kOrbToRosEnu * pt_orb : pt_orb);
         valid_pts.push_back({static_cast<float>(pt_ros.x()),
                              static_cast<float>(pt_ros.y()),
                              static_cast<float>(pt_ros.z())});
     }
+    if (map_lock) map_lock.unlock();
+    if (map && valid_pts.empty()) return;
 
     if (valid_pts.empty()) return;
 
@@ -280,6 +316,8 @@ void SlamWorker::run()
             slam_->ResetActiveMap();
             initial_offset_set_ = false;
             ++vision_epoch_;
+            map_origin_.reset();
+            map_alignments_.clear();
             path_msg_.poses.clear();
             RCLCPP_INFO(node_->get_logger(), "SlamWorker: SLAM reset applied");
         }
@@ -313,7 +351,36 @@ void SlamWorker::run()
         processed_frames_++;
         publishTrackedImage(frame->stamp);
 
-        const bool tracking = state == 2 || state == 5;
+        bool tracking = state == 2 || state == 5;
+        ORB_SLAM3::Map * map = nullptr;
+        if (tracking && cfg_.ekf_pose_at) {
+            for (auto * point : slam_->GetTrackedMapPoints()) {
+                if (!point || point->isBad()) continue;
+                map = point->GetMap();
+                if (map) break;
+            }
+            if (map) {
+                const auto origin = map->GetInitKFid();
+                const int big_change = map->GetLastBigChangeIdx();
+                if (map_origin_ && *map_origin_ != origin) {
+                    ++vision_epoch_;
+                    // A merge can switch maps while TrackStereo returns. A just
+                    // initialized stereo map has one keyframe and a valid pose.
+                    tracking = map->KeyFramesInMap() == 1;
+                    if (map_alignments_.contains(origin)) {
+                        path_msg_.poses.clear();
+                        RCLCPP_INFO(node_->get_logger(),
+                            "SlamWorker: returning to aligned map origin %lu", origin);
+                    }
+                } else if (map_origin_ && big_change != map_big_change_) {
+                    ++vision_epoch_;
+                }
+                map_origin_ = origin;
+                map_big_change_ = big_change;
+            } else {
+                tracking = false;
+            }
+        }
         if (!tracking && vision_tracking_) ++vision_epoch_;
         vision_tracking_ = tracking;
         if (tracking) {
@@ -332,7 +399,9 @@ void SlamWorker::run()
                 last_cloud_pub_ = frame->stamp;
             }
         }
-        if (pub_cloud_now) publishCloud(frame->stamp);
+        if (pub_cloud_now && (tracking || !cfg_.ekf_pose_at)) {
+            publishCloud(frame->stamp, map);
+        }
         metrics_.record(processing_start, frame->received_at);
         if (trace) {
             const auto ms = [](auto a, auto b) {

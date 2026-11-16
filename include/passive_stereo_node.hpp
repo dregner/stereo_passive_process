@@ -4,6 +4,8 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
@@ -46,6 +48,8 @@ private:
 
     void onSlamReset(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
                      std::shared_ptr<std_srvs::srv::Trigger::Response> res);
+    void onSaveRawImages(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+                         std::shared_ptr<std_srvs::srv::Trigger::Response> res);
 
     // ── Workers ────────────────────────────────────────────────────────────────
     std::unique_ptr<SpinnakerGrabber>  grabber_;
@@ -73,6 +77,11 @@ private:
 
     // ── Services ───────────────────────────────────────────────────────────────
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_srv_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_raw_images_srv_;
+    std::mutex raw_snapshot_mutex_;
+    std::condition_variable raw_snapshot_ready_;
+    bool raw_snapshot_requested_{false};
+    StereoFramePtr raw_snapshot_;
 
     // ── Feature flags ──────────────────────────────────────────────────────────
     bool slam_enabled_{true};

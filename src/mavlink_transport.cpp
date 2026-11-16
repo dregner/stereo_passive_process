@@ -52,7 +52,8 @@ speed_t baud(int n) {
     }
 }
 }
-MavlinkTransport::MavlinkTransport(const std::string & url)
+MavlinkTransport::MavlinkTransport(const std::string & url, bool receive)
+: receive_(receive)
 {
     try {
         if (url.starts_with("serial://")) {
@@ -61,7 +62,8 @@ MavlinkTransport::MavlinkTransport(const std::string & url)
             if (colon == std::string::npos || body.empty() || body.front() != '/')
                 throw std::invalid_argument("Expected serial:///absolute/device:baud");
             const auto speed = baud(number(body.substr(colon + 1), 1, 1000000));
-            fd_ = ::open(body.substr(0, colon).c_str(), O_WRONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+            const int access = receive_ ? O_RDWR : O_WRONLY;
+            fd_ = ::open(body.substr(0, colon).c_str(), access | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
             if (fd_ < 0) fail("MAVLink serial open");
             serial_ = true;
             termios opts{};
@@ -114,11 +116,27 @@ void MavlinkTransport::send(const uint8_t * data, std::size_t size)
         if (n <= 0) {
             const int error = n < 0 ? errno : EIO;
             // A partial stream packet cannot be resumed on a later sample.
-            if (sent || (error != EAGAIN && error != EWOULDBLOCK && error != ENOBUFS)) close();
+            if (sent || (!(receive_ && datagram_) &&
+                         error != EAGAIN && error != EWOULDBLOCK && error != ENOBUFS)) close();
             throw std::system_error(error, std::generic_category(), "MAVLink nonblocking send");
         }
         sent += static_cast<std::size_t>(n);
         if (datagram_ && sent != size) { close(); throw std::runtime_error("Partial MAVLink UDP datagram"); }
     }
+}
+
+std::size_t MavlinkTransport::receive(uint8_t * data, std::size_t capacity)
+{
+    if (fd_ < 0) return 0;
+    ssize_t count;
+    do {
+        count = serial_ ? ::read(fd_, data, capacity) : ::recv(fd_, data, capacity, MSG_DONTWAIT);
+    } while (count < 0 && errno == EINTR);
+    if (count > 0) return static_cast<std::size_t>(count);
+    if (count == 0 && datagram_) return 0;
+    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+    const int error = count == 0 ? ECONNRESET : errno;
+    if (!datagram_) close();
+    throw std::system_error(error, std::generic_category(), "MAVLink nonblocking receive");
 }
 }

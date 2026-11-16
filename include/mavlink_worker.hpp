@@ -4,12 +4,15 @@
 #include <thread>
 #include <functional>
 #include <memory>
+#include <optional>
 #include "mavlink_transport.hpp"
 #include "bounded_queue.hpp"
 #include "mavlink_vision.hpp"
 
 namespace passive_stereo_capture
 {
+class MavlinkEkf;
+
 class MavlinkWorker
 {
 public:
@@ -23,12 +26,16 @@ public:
         double position_variance{0.05};
         double angle_variance{0.1};
         double confidence{100.0};
+        bool receive_ekf{false};
+        int autopilot_system_id{1};
+        double ekf_max_skew_sec{0.15};
     };
     using Clock = std::function<uint64_t()>;  // Microseconds, same clock as VisionSample.
     using ErrorSink = std::function<void(const std::string &)>;
     explicit MavlinkWorker(const Config & cfg, Clock clock = {}, ErrorSink errors = {});
     ~MavlinkWorker();
     void push(VisionSample sample);
+    std::optional<Eigen::Isometry3d> ekfPoseAt(uint64_t usec) const;
     void stop();
 private:
     void run();
@@ -36,6 +43,7 @@ private:
     ErrorSink errors_;
     Config cfg_;
     std::unique_ptr<MavlinkTransport> bridge_;
+    std::unique_ptr<MavlinkEkf> ekf_;
     BoundedQueue<VisionSample> queue_{1, true};
     std::atomic<bool> running_{true};
     std::thread thread_;

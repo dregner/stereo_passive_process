@@ -6,6 +6,8 @@
 #include <string>
 #include <chrono>
 #include <functional>
+#include <map>
+#include <optional>
 #include "mavlink_vision.hpp"
 
 #include <rclcpp/rclcpp.hpp>
@@ -55,6 +57,7 @@ public:
         int    clahe_tiles{8};
         bool   clahe_enabled{false};
         std::function<void(VisionSample)> vision_sink;
+        std::function<std::optional<Eigen::Isometry3d>(uint64_t)> ekf_pose_at;
         std::string trace_path; ///< Optional tracking timing/state CSV
     };
 
@@ -92,7 +95,7 @@ public:
 private:
     void run();
     void publishPose(const Sophus::SE3f & se3, const rclcpp::Time & stamp, int tracking_state);
-    void publishCloud(const rclcpp::Time & stamp);
+    void publishCloud(const rclcpp::Time & stamp, ORB_SLAM3::Map * map);
     void publishTrackedImage(const rclcpp::Time & stamp);
     tf2::Transform sophusToTf(const Sophus::SE3f & pose);
     void tryLookupTf();
@@ -124,6 +127,9 @@ private:
     bool initial_offset_set_{false};
     uint64_t vision_epoch_{0};
     bool vision_tracking_{false};
+    std::optional<unsigned long> map_origin_;
+    std::map<unsigned long, tf2::Transform> map_alignments_;
+    int map_big_change_{0};
 
     nav_msgs::msg::Path path_msg_;
     RateLimiter path_limiter_;

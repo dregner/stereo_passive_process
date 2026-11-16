@@ -88,6 +88,7 @@ retrieval fails, because raw color would not align with rectified XYZ.
 | ORB-SLAM3 | — | Build at `/home/daniel/ORB_SLAM3` |
 | Retinify | — | GPU stereo depth library (`libretinify.so`) |
 | OpenCV | 4.x | With CUDA support recommended |
+| libjpeg | — | `libjpeg-dev` on Ubuntu |
 | CUDA Toolkit | 12.x | For Retinify pinned memory and GPU operations |
 | Eigen3 | 3.4+ | |
 | Sophus | — | From ORB-SLAM3 third-party |
@@ -409,6 +410,25 @@ added, and that same bag with a remote GUI connected.
 | Service | Type | Description |
 |---|---|---|
 | `/Passive/slam/reset` | `std_srvs/Trigger` | Reset ORB-SLAM3 map and initial pose offset |
+| `/Passive/save_raw_images` | `std_srvs/srv/Trigger` | Save the next synchronized stereo pair and return its directory |
+
+To save one pair from the running node:
+
+```bash
+ros2 service call /Passive/save_raw_images std_srvs/srv/Trigger '{}'
+```
+
+The node waits up to two seconds for a synchronized pair. Each request saves
+full-resolution, unrectified BGR8 images demosaiced from the raw Bayer frames
+before CLAHE and host color correction. The `.jpeg` files use quality 100 and
+4:4:4 sampling. Standard JPEG still applies lossy compression at this setting.
+
+Set the `raw_image_output_dir` node parameter to choose the parent directory on
+the camera host. The default is `data` relative to the node's working directory.
+The service returns the absolute path of the new `YYYYMMDD_HHMM` directory, named
+using the camera host's local time. It contains `left/image.jpeg` and
+`right/image.jpeg`. If the name already exists, the service tries `_1`, `_2`,
+and so on, preserving earlier captures.
 
 ---
 
@@ -1024,6 +1044,47 @@ delta packet an absolute position update. See the
 [ArduPilot delta handler](https://github.com/ArduPilot/ardupilot/blob/master/libraries/AP_VisualOdom/AP_VisualOdom_Backend.cpp)
 and [MAVLink delta definition](https://mavlink.io/en/messages/ardupilotmega.html#VISION_POSITION_DELTA).
 The node sends observations only; it does not change controller parameters.
+
+### Align ROS SLAM maps to ArduSub's EKF
+
+Enable `slam_ekf_alignment` to anchor each stereo map in the autopilot's local
+navigation frame. For a receive-only trial, use the MAVLink endpoint that
+provides telemetry to this process:
+
+```bash
+ros2 launch passive_stereo_capture passive_stereo_capture.launch.py \
+  params_file:=/path/to/passive_stereo.yaml slam:=true slam_ekf_alignment:=true \
+  mavlink_bridge_url:='udp://:14555@127.0.0.1:14550'
+```
+
+Use the actual router or autopilot address and port for your link. With UDP,
+telemetry must return from the configured remote address and port to the local
+port. The worker requests `LOCAL_POSITION_NED` and `ATTITUDE_QUATERNION` at
+20 Hz and `EKF_STATUS_REPORT` at 5 Hz over that endpoint. Set
+`mavlink_autopilot_system_id` in the parameter file if the autopilot's system
+ID differs from 1. Component ID 1 is the autopilot.
+
+Alignment requires `slam_enu_publish: true`, the camera-to-base TF, a healthy
+horizontal EKF estimate, and a `TIMESYNC` response on the link. The node pairs
+the closest position and attitude with the camera's host timestamp, using
+velocity and angular rate for the short time difference. The default maximum
+skew is 0.15 s, configurable through `mavlink_ekf_max_skew_sec`. A map awaiting
+an anchor withholds its ROS pose and cloud. The log reports when a map is placed
+in the EKF's local ENU frame (east, north, up).
+
+Each initialized map gets one rigid transform for ROS pose, TF, path and cloud.
+Same-map recovery reuses it, and a merge into a previously aligned map uses
+that map's transform and restarts the published path. During tracking loss,
+the SLAM pose pauses and the last cloud stays visible. Cloud messages contain
+the active ORB map. The EKF supplies an initial placement for disconnected
+maps, with accuracy limited by its navigation estimate across the gap.
+
+`mavlink_enabled` independently enables outgoing SLAM vision; it defaults to
+false. Outgoing vision uses the SLAM estimate before EKF alignment. On the
+first trial, compare the ROS pose and cloud through a tracking outage and
+reinitialization while moving and turning. If the EKF changes its local
+reference during a run (for example, on an autopilot reboot), restart the
+node to establish a common frame for the new run.
 
 `mavlink_worker_test` exercises real MAVLink 2 packets over localhost UDP:
 message IDs/source IDs, XY sign conversion, current-body delta translation and
