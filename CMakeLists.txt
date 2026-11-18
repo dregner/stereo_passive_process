@@ -140,7 +140,6 @@ set(SOURCES
   src/preview_worker.cpp
   src/raw_snapshot.cpp
   src/passive_stereo_node.cpp
-  src/passive_stereo_component.cpp
 )
 
 add_library(passive_stereo_component SHARED ${SOURCES})

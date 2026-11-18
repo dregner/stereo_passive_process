@@ -45,16 +45,21 @@ private:
     void preprocessThread();
     void reportTimerCallback();
     void stopPipeline();
+    void startMavlink(bool send_vision, bool align_to_ekf);
 
     void onSlamReset(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
                      std::shared_ptr<std_srvs::srv::Trigger::Response> res);
     void onSaveRawImages(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
                          std::shared_ptr<std_srvs::srv::Trigger::Response> res);
+    void onToggleMavlinkVision(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+                               std::shared_ptr<std_srvs::srv::Trigger::Response> res);
 
     // ── Workers ────────────────────────────────────────────────────────────────
     std::unique_ptr<SpinnakerGrabber>  grabber_;
     std::unique_ptr<StereoCalib>       calib_;
     std::unique_ptr<MavlinkWorker>     mavlink_worker_;
+    // Published once, either at startup or on the first toggle. SLAM stops before the worker.
+    std::atomic<MavlinkWorker *>       mavlink_worker_for_slam_{nullptr};
     std::unique_ptr<SlamWorker>        slam_worker_;
     std::unique_ptr<DisparityWorker>   disp_worker_;
     std::unique_ptr<PreviewWorker>     prev_worker_;
@@ -77,6 +82,7 @@ private:
 
     // ── Services ───────────────────────────────────────────────────────────────
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_srv_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr toggle_mavlink_vision_srv_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_raw_images_srv_;
     std::mutex raw_snapshot_mutex_;
     std::condition_variable raw_snapshot_ready_;

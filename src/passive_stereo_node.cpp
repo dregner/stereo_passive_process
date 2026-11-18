@@ -11,7 +11,7 @@
 #include "cuda_color_converter.hpp"
 #include "color_correction.hpp"
 #include "spinnaker_color_correction.hpp"
-
+#include <rclcpp_components/register_node_macro.hpp>
 namespace passive_stereo_capture
 {
 
@@ -231,31 +231,7 @@ void PassiveStereoNode::init()
 
     const bool send_vision = get_parameter("mavlink_enabled").as_bool();
     const bool align_to_ekf = get_parameter("slam_ekf_alignment").as_bool();
-    if (send_vision || align_to_ekf) {
-        if (!slam_enabled_ || !get_parameter("slam_enu_publish").as_bool())
-            throw std::invalid_argument("MAVLink requires slam_enabled and slam_enu_publish");
-        MavlinkWorker::Config cfg;
-        cfg.bridge_url = get_parameter("mavlink_bridge_url").as_string();
-        cfg.message = get_parameter("mavlink_message").as_string();
-        cfg.system_id = get_parameter("mavlink_system_id").as_int();
-        cfg.component_id = get_parameter("mavlink_component_id").as_int();
-        cfg.max_gap_sec = get_parameter("mavlink_max_gap_sec").as_double();
-        cfg.map_yaw_deg = get_parameter("mavlink_map_yaw_deg").as_double();
-        cfg.position_variance = get_parameter("mavlink_position_variance").as_double();
-        cfg.angle_variance = get_parameter("mavlink_angle_variance").as_double();
-        cfg.confidence = get_parameter("mavlink_confidence").as_double();
-        cfg.receive_ekf = align_to_ekf;
-        cfg.autopilot_system_id = get_parameter("mavlink_autopilot_system_id").as_int();
-        cfg.ekf_max_skew_sec = get_parameter("mavlink_ekf_max_skew_sec").as_double();
-        mavlink_worker_ = std::make_unique<MavlinkWorker>(cfg,
-            [this] { return static_cast<uint64_t>(now().nanoseconds() / 1000); },
-            [this](const std::string & error) {
-                RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
-                    "Direct MAVLink I/O failed: %s", error.c_str());
-            });
-        if (send_vision)
-            RCLCPP_INFO(get_logger(), "MAVLink vision waits for camera-to-base TF before sending");
-    }
+    if (send_vision || align_to_ekf) startMavlink(send_vision, align_to_ekf);
 
     // ── SLAM Worker ────────────────────────────────────────────────────────────
     if (slam_enabled_) {
@@ -293,9 +269,9 @@ void PassiveStereoNode::init()
         slam_cfg.clahe_enabled   = enable_clahe_val;
         slam_cfg.trace_path      = get_parameter("slam_trace_path").as_string();
 
-        if (send_vision) {
+        if (slam_cfg.enu_publish) {
             slam_cfg.vision_sink = [this](VisionSample sample) {
-                mavlink_worker_->push(std::move(sample));
+                if (auto * worker = mavlink_worker_for_slam_.load()) worker->push(std::move(sample));
             };
         }
         if (align_to_ekf) {
@@ -310,6 +286,12 @@ void PassiveStereoNode::init()
             mk("slam/reset"),
             std::bind(&PassiveStereoNode::onSlamReset, this,
                       std::placeholders::_1, std::placeholders::_2));
+        if (slam_cfg.enu_publish) {
+            toggle_mavlink_vision_srv_ = create_service<std_srvs::srv::Trigger>(
+                mk("slam/toggle_mavlink_vision"),
+                std::bind(&PassiveStereoNode::onToggleMavlinkVision, this,
+                          std::placeholders::_1, std::placeholders::_2));
+        }
     }
 
     // ── Disparity Worker ───────────────────────────────────────────────────────
@@ -581,6 +563,35 @@ void PassiveStereoNode::preprocessThread()
     }
 }
 
+void PassiveStereoNode::startMavlink(bool send_vision, bool align_to_ekf)
+{
+    if (!slam_enabled_ || !get_parameter("slam_enu_publish").as_bool())
+        throw std::invalid_argument("MAVLink requires slam_enabled and slam_enu_publish");
+    MavlinkWorker::Config cfg;
+    cfg.bridge_url = get_parameter("mavlink_bridge_url").as_string();
+    cfg.message = get_parameter("mavlink_message").as_string();
+    cfg.system_id = get_parameter("mavlink_system_id").as_int();
+    cfg.component_id = get_parameter("mavlink_component_id").as_int();
+    cfg.max_gap_sec = get_parameter("mavlink_max_gap_sec").as_double();
+    cfg.map_yaw_deg = get_parameter("mavlink_map_yaw_deg").as_double();
+    cfg.position_variance = get_parameter("mavlink_position_variance").as_double();
+    cfg.angle_variance = get_parameter("mavlink_angle_variance").as_double();
+    cfg.confidence = get_parameter("mavlink_confidence").as_double();
+    cfg.receive_ekf = align_to_ekf;
+    cfg.send_vision = send_vision;
+    cfg.autopilot_system_id = get_parameter("mavlink_autopilot_system_id").as_int();
+    cfg.ekf_max_skew_sec = get_parameter("mavlink_ekf_max_skew_sec").as_double();
+    mavlink_worker_ = std::make_unique<MavlinkWorker>(cfg,
+        [this] { return static_cast<uint64_t>(now().nanoseconds() / 1000); },
+        [this](const std::string & error) {
+            RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                "Direct MAVLink I/O failed: %s", error.c_str());
+        });
+    mavlink_worker_for_slam_.store(mavlink_worker_.get());
+    if (send_vision)
+        RCLCPP_INFO(get_logger(), "MAVLink vision waits for camera-to-base TF before sending");
+}
+
 void PassiveStereoNode::onSlamReset(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
     std::shared_ptr<std_srvs::srv::Trigger::Response> res)
@@ -588,6 +599,25 @@ void PassiveStereoNode::onSlamReset(
     if (slam_worker_) slam_worker_->reset();
     res->success = true;
     res->message = "SLAM reset";
+}
+
+void PassiveStereoNode::onToggleMavlinkVision(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+{
+    try {
+        bool enabled = true;
+        if (mavlink_worker_) {
+            enabled = mavlink_worker_->toggleVision();
+        } else {
+            startMavlink(true, false);
+        }
+        res->success = true;
+        res->message = enabled ? "MAVLink vision enabled" : "MAVLink vision disabled";
+    } catch (const std::exception & ex) {
+        res->success = false;
+        res->message = ex.what();
+    }
 }
 
 void PassiveStereoNode::onSaveRawImages(
@@ -620,3 +650,4 @@ void PassiveStereoNode::onSaveRawImages(
 }
 
 }  // namespace passive_stereo_capture
+RCLCPP_COMPONENTS_REGISTER_NODE(passive_stereo_capture::PassiveStereoNode)

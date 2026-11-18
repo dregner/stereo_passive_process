@@ -1,15 +1,18 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.conditions import IfCondition
 
 def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument(
             'params_file',
-            default_value='/home/jetson/ros2_ws/src/stereo_passive_process/config/passive_stereo_lab.yaml',
+            default_value='/home/jetson/ros2_ws/src/stereo_passive_process/config/passive_stereo_rov.yaml',
 
             description='Path to the passive_stereo YAML parameter file'),
 
@@ -20,11 +23,11 @@ def generate_launch_description():
             description='Path to the OpenCV stereo calibration YAML'),
 
         DeclareLaunchArgument('slam', default_value='false', description='Enable SLAM'),
-
+        DeclareLaunchArgument('description', default_value='true', description='Enable Robot Description'),
         DeclareLaunchArgument('disparity', default_value='false', description='Enable Disparity'),
 
         DeclareLaunchArgument('mavlink_enabled', default_value='false',  description='Open the MAVLink bridge inside the capture process'),
-        DeclareLaunchArgument('mavlink_bridge_url', default_value="udp://0.0.0.0:0@150.162.167.10:14771", description='Direct UDP, TCP or serial connection URL'),
+        DeclareLaunchArgument('mavlink_bridge_url', default_value="udp://0.0.0.0:0@192.168.2.2:14771", description='Direct UDP, TCP or serial connection URL'),
         DeclareLaunchArgument('mavlink_message', default_value='estimate', choices=['estimate', 'delta'], description='Vision MAVLink message type'),
         DeclareLaunchArgument('slam_ekf_alignment', default_value='false', description='Align ROS SLAM maps to EKF telemetry from the MAVLink endpoint'),
 
@@ -46,11 +49,16 @@ def generate_launch_description():
                 }
             ],
         ),
-        Node(
-                package='foxglove_bridge',
-                executable='foxglove_bridge',
-                name='foxglove_bridge',
-                output='screen',
-                ros_arguments=['--log-level', 'WARN'],
-            )
+        # Node(
+        #         package='foxglove_bridge',
+        #         executable='foxglove_bridge',
+        #         name='foxglove_bridge',
+        #         output='screen',
+        #         ros_arguments=['--log-level', 'ERROR'],
+        #     ),
+
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource([PathJoinSubstitution([FindPackageShare('voris_description'), 'launch', 'voris_visualize.launch.py'])]),
+            condition=IfCondition(LaunchConfiguration('description')),
+        ),
     ])

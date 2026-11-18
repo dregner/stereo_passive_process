@@ -9,7 +9,7 @@
 namespace passive_stereo_capture
 {
 MavlinkWorker::MavlinkWorker(const Config & cfg, Clock clock, ErrorSink errors)
-: clock_(std::move(clock)), errors_(std::move(errors)), cfg_(cfg)
+: clock_(std::move(clock)), errors_(std::move(errors)), cfg_(cfg), send_vision_(cfg.send_vision)
 {
     if (cfg.message != "estimate" && cfg.message != "delta")
         throw std::invalid_argument("mavlink_message must be estimate or delta");
@@ -36,7 +36,19 @@ MavlinkWorker::MavlinkWorker(const Config & cfg, Clock clock, ErrorSink errors)
 
 MavlinkWorker::~MavlinkWorker() { stop(); }
 
-void MavlinkWorker::push(VisionSample sample) { queue_.push(std::move(sample)); }
+void MavlinkWorker::push(VisionSample sample)
+{
+    std::lock_guard lock(vision_mutex_);
+    if (send_vision_) queue_.push({std::move(sample), vision_generation_});
+}
+
+bool MavlinkWorker::toggleVision()
+{
+    std::lock_guard lock(vision_mutex_);
+    ++vision_generation_;
+    send_vision_ = !send_vision_;
+    return send_vision_;
+}
 
 std::optional<Eigen::Isometry3d> MavlinkWorker::ekfPoseAt(uint64_t usec) const
 {
@@ -57,6 +69,7 @@ void MavlinkWorker::run()
     VisionSample previous;
     bool have_previous = false;
     uint8_t reset_counter = 0;
+    uint64_t previous_generation = 0;
     const double yaw = cfg_.map_yaw_deg * std::numbers::pi / 180.0;
     while (running_.load()) {
         if (ekf_) {
@@ -66,9 +79,18 @@ void MavlinkWorker::run()
                 if (errors_) errors_(ex.what());
             }
         }
-        VisionSample sample;
+        QueuedVision pending;
         const auto timeout = std::chrono::milliseconds(ekf_ ? 5 : 200);
-        if (!queue_.pop(sample, timeout) || !running_.load()) continue;
+        if (!queue_.pop(pending, timeout) || !running_.load()) continue;
+        // Serialize writes with the service and discard samples queued before a toggle.
+        std::unique_lock lock(vision_mutex_);
+        if (!send_vision_ || pending.generation != vision_generation_) continue;
+        if (pending.generation != previous_generation) {
+            if (have_previous) ++reset_counter;
+            have_previous = false;
+            previous_generation = pending.generation;
+        }
+        const auto & sample = pending.sample;
         if (sample.usec == 0 || !sample.position.allFinite() ||
             !sample.orientation.coeffs().allFinite() ||
             std::abs(sample.orientation.norm() - 1.0) > 1e-3) {
@@ -133,6 +155,7 @@ void MavlinkWorker::run()
             // Never bridge across a failed send with an unreported delta.
             have_previous = false;
             ++reset_counter;
+            lock.unlock();
             if (errors_) errors_(ex.what());
         }
     }
